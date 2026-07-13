@@ -1,0 +1,16 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aibroker-migrate
+  namespace: aibroker
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: aibroker-api:latest
+          command: ["corepack", "pnpm", "db:migrate"]
+          envFrom:
+            - secretRef:
+                name: aibroker-secrets

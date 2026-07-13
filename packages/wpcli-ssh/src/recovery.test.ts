@@ -1,0 +1,2 @@
+import{describe,expect,it}from"vitest";import{buildRecoveryCommand}from"./recovery.js";
+describe("recovery commands",()=>{it("uses a fixed helper and rejects control characters",()=>{expect(buildRecoveryCommand("database_search_replace_preview",{search:"old",replace:"new"})).toEqual(["bash","/usr/local/lib/aibroker/recovery.sh","database_search_replace_preview","--wp-cli=wp","--search=old","--replace=new"]);expect(()=>buildRecoveryCommand("database_import",{id:"x\n--bad"})).toThrow();});});

@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aibroker-worker
+  namespace: aibroker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aibroker-worker
+  template:
+    metadata:
+      labels:
+        app: aibroker-worker
+    spec:
+      containers:
+        - name: worker
+          image: aibroker-worker:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: aibroker-secrets
+          env:
+            - name: NODE_ENV
+              value: production
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

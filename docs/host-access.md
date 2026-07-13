@@ -1,0 +1,15 @@
+# Host access
+
+SSH is a singleton server plugin. Adding it creates a disabled instance; it becomes enabled only after the one-time provisioning flow succeeds. A global administrator supplies a pinned, sudo-capable bootstrap SSH key in the danger confirmation. AIBroker holds that key in memory only, generates a new Ed25519 keypair, converges the dedicated account and ACLs, installs a forced-command key and reviewed sudoers allow-list, encrypts the confined private key, and discards the bootstrap key. Re-provisioning is idempotent. De-provisioning requires elevation again because the confined account cannot remove itself.
+
+The provisioning preview is authoritative: it shows the dedicated username, workspace root, authorized-key path, forced-command helper, and exact sudoers lines before any remote command runs. The plugin owns this profile; users choose the target and workspace root but cannot broaden the helper allow-list.
+
+The administrator must pin both the OpenSSH `known_hosts` entry and its `SHA256:` fingerprint. Private keys and optional passphrases are encrypted in the broker vault, decrypted only by the worker, written to a mode-0600 temporary directory for the connection, cleared from mutable memory, and never returned by an API.
+
+Typed WP-CLI and workspace calls create durable operations. Operations have bounded execution time and output, support cancellation, serialize per server, and retain bounded stdout/stderr plus an audit result. Workspace commands run through the installed `aibroker-workspace` remote helper, which resolves real paths beneath the configured root and must reject symlink escape. The broker also rejects traversal, protected credential filenames, unapproved extensions, unnamed commands, and stale hashes before invoking that helper.
+
+Routine access uses typed `ssh.*` tools through the workspace jail. `ssh.run_command` is the break-glass exception: it is `Operate`/`critical`, absent from Manage and lower access levels, and requires an explicit Full SSH intent plus a justification. The complete command, stdout, stderr, status, actor, reason, and timing are retained, and invocation emits a distinct `break_glass_used` audit event. It always runs as the confined account—AIBroker never stores root or sudo credentials.
+
+Policy is checked when a session starts. Policy changes prevent new sessions but do not silently rewrite the authority of an already-open OS session. Ending the session or disabling/replacing its brokered credential terminates it; credential revocation is polled during the session. This behavior favors an explicit, visible session boundary while still providing an immediate central kill switch through credential revocation.
+
+The API provisioning service and worker require the system OpenSSH client; provisioning also uses `ssh-agent`/`ssh-add` so the bootstrap key can be passed over stdin instead of written to disk. The remote host must provide `useradd`, `setfacl`, `visudo`, and the reviewed `aibroker-workspace` helper.

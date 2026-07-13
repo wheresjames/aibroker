@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aibroker-web
+  namespace: aibroker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aibroker-web
+  template:
+    metadata:
+      labels:
+        app: aibroker-web
+    spec:
+      containers:
+        - name: web
+          image: aibroker-web:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aibroker-web
+  namespace: aibroker
+spec:
+  selector:
+    app: aibroker-web
+  ports:
+    - port: 3000
+      targetPort: 3000

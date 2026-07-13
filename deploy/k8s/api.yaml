@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aibroker-api
+  namespace: aibroker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aibroker-api
+  template:
+    metadata:
+      labels:
+        app: aibroker-api
+    spec:
+      containers:
+        - name: api
+          image: aibroker-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: aibroker-secrets
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: AIBROKER_API_PORT
+              value: "8080"
+            - name: AIBROKER_PUBLIC_URL
+              value: https://aibroker.example.com
+            - name: AIBROKER_MCP_ENABLED
+              value: "true"
+            - name: AIBROKER_BROWSER_WORKER_URL
+              value: http://aibroker-browser-worker:8090
+            - name: AIBROKER_ARTIFACT_BACKEND
+              value: s3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aibroker-api
+  namespace: aibroker
+spec:
+  selector:
+    app: aibroker-api
+  ports:
+    - port: 8080
+      targetPort: 8080

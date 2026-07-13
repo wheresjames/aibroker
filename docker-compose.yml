@@ -1,0 +1,149 @@
+services:
+  aibroker-api:
+    build:
+      context: .
+      dockerfile: deploy/docker/api.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AIBROKER_DATABASE_URL: postgres://aibroker:aibroker@postgres:5432/aibroker
+      AIBROKER_REDIS_URL: redis://redis:6379
+      AIBROKER_SESSION_SECRET: ${AIBROKER_SESSION_SECRET:-local_development_session_secret_change_me}
+      AIBROKER_ENCRYPTION_KEY_BASE64: ${AIBROKER_ENCRYPTION_KEY_BASE64:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+      AIBROKER_SANDBOX_ENABLED: ${AIBROKER_SANDBOX_ENABLED:-true}
+      AIBROKER_BROWSER_WORKER_URL: http://aibroker-browser-worker:8090
+      AIBROKER_BROWSER_WORKER_SECRET: ${AIBROKER_BROWSER_WORKER_SECRET:-local_browser_worker_secret_change_me}
+      AIBROKER_BROWSER_ALLOW_PRIVATE_TARGETS: ${AIBROKER_BROWSER_ALLOW_PRIVATE_TARGETS:-true}
+      AIBROKER_ARTIFACT_BACKEND: filesystem
+      AIBROKER_ARTIFACT_FILESYSTEM_ROOT: /data/artifacts
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      aibroker-browser-worker:
+        condition: service_healthy
+    volumes:
+      - ./data/artifacts:/data/artifacts
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  aibroker-web:
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "3000:3000"
+    depends_on:
+      aibroker-api:
+        condition: service_healthy
+
+  aibroker-worker:
+    build:
+      context: .
+      dockerfile: deploy/docker/worker.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AIBROKER_DATABASE_URL: postgres://aibroker:aibroker@postgres:5432/aibroker
+      AIBROKER_REDIS_URL: redis://redis:6379
+      AIBROKER_SESSION_SECRET: ${AIBROKER_SESSION_SECRET:-local_development_session_secret_change_me}
+      AIBROKER_ENCRYPTION_KEY_BASE64: ${AIBROKER_ENCRYPTION_KEY_BASE64:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      aibroker-api:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  aibroker-browser-worker:
+    build:
+      context: .
+      dockerfile: deploy/docker/browser-worker.Dockerfile
+    environment:
+      AIBROKER_BROWSER_WORKER_SECRET: ${AIBROKER_BROWSER_WORKER_SECRET:-local_browser_worker_secret_change_me}
+      AIBROKER_BROWSER_WORKER_PORT: 8090
+      AIBROKER_BROWSER_MAX_CONCURRENT: ${AIBROKER_BROWSER_MAX_CONCURRENT:-4}
+      AIBROKER_BROWSER_MAX_SESSIONS: ${AIBROKER_BROWSER_MAX_SESSIONS:-20}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    ipc: private
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+          pids: 256
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: aibroker
+      POSTGRES_USER: aibroker
+      POSTGRES_PASSWORD: aibroker
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aibroker -d aibroker"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  wordpress-db:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: wordpress
+    volumes:
+      - ./data/wordpress-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  wordpress:
+    image: wordpress:6-apache
+    environment:
+      WORDPRESS_DB_HOST: wordpress-db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+    ports:
+      - "8081:80"
+    depends_on:
+      wordpress-db:
+        condition: service_healthy

@@ -1,0 +1,40 @@
+{
+  "name": "@aibroker/api",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@aibroker/audit": "workspace:*",
+    "@aibroker/artifacts": "workspace:*",
+    "@aibroker/auth": "workspace:*",
+    "@aibroker/core": "workspace:*",
+    "@aibroker/crypto": "workspace:*",
+    "@aibroker/db": "workspace:*",
+    "@aibroker/mcp-tools": "workspace:^",
+    "@aibroker/plugin-sdk": "workspace:*",
+    "@aibroker/plugin-catalog": "workspace:*",
+    "@aibroker/plugin-playwright": "workspace:*",
+    "@aibroker/plugin-ssh": "workspace:*",
+    "@aibroker/plugin-postgres": "workspace:*",
+    "@aibroker/plugin-wordpress": "workspace:*",
+    "@aibroker/policy": "workspace:*",
+    "@aibroker/wordpress-rest": "workspace:*",
+    "@aibroker/wpcli-ssh": "workspace:*",
+    "fastify": "^5.2.1",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.11",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

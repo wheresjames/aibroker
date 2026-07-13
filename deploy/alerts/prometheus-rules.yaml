@@ -1,0 +1,87 @@
+groups:
+  - name: aibroker
+    rules:
+      - alert: AIBrokerAuthFailures
+        expr: increase(aibroker_auth_failures_total[10m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Repeated AIBroker admin authentication failures
+      - alert: AIBrokerApprovalQueueGrowing
+        expr: aibroker_approval_queue_depth > 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker approval queue is growing
+      - alert: AIBrokerCredentialFailures
+        expr: increase(aibroker_credential_failures_total[15m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker connector credential failures increased
+      - alert: AIBrokerWorkerFailures
+        expr: increase(aibroker_worker_job_failures_total[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker worker jobs are failing
+      - alert: AIBrokerBrowserWorkerUnavailable
+        expr: up{job="aibroker-browser-worker"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker browser inspection worker is unavailable
+      - alert: AIBrokerBrowserConcurrencySaturated
+        expr: aibroker_browser_requests_in_flight >= aibroker_browser_max_concurrent
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker browser inspection concurrency is saturated
+      - alert: AIBrokerBrowserSessionCapacitySaturated
+        expr: aibroker_browser_live_sessions >= aibroker_browser_max_sessions
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker browser session capacity is saturated
+      - alert: AIBrokerBrowserFailures
+        expr: increase(aibroker_browser_failures_total[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker browser inspection operations are repeatedly failing
+      - alert: AIBrokerBrowserCrashes
+        expr: increase(aibroker_browser_crashes_total[15m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker Chromium processes are repeatedly crashing
+      - alert: AIBrokerBrowserBlockedRequestSpike
+        expr: increase(aibroker_browser_blocked_requests_total[10m]) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker browser worker is blocking an unusual number of requests
+      - alert: AIBrokerArtifactCleanupBacklog
+        expr: aibroker_artifact_cleanup_backlog > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker artifact expiry cleanup is backlogged
+      - alert: AIBrokerBrowserSessionFailures
+        expr: increase(aibroker_browser_sessions_failed_total[15m]) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AIBroker browser sessions are being lost or failing to open

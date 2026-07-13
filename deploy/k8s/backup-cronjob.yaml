@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aibroker-postgres-backup
+  namespace: aibroker
+spec:
+  schedule: "*/15 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: aibroker-api:latest
+              command: ["/bin/sh", "-lc"]
+              args:
+                - corepack pnpm db:migrate >/dev/null && ./scripts/backup-postgres.sh
+              envFrom:
+                - secretRef:
+                    name: aibroker-secrets
+              volumeMounts:
+                - name: backups
+                  mountPath: /app/backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: aibroker-backups

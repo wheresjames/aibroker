@@ -1,0 +1,8 @@
+name            aibroker
+version         0.1.0
+description     AI MCP Broker
+company         wheresjames
+author          Robert Umbehant
+email           aibroker@wheresjames.com
+url             https://github.com/wheresjames/aibroker
+license         MIT

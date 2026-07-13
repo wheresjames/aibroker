@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aibroker-browser-worker
+  namespace: aibroker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aibroker-browser-worker
+  template:
+    metadata:
+      labels:
+        app: aibroker-browser-worker
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: browser-worker
+          image: aibroker-browser-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8090
+          envFrom:
+            - secretRef:
+                name: aibroker-secrets
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: AIBROKER_BROWSER_MAX_CONCURRENT
+              value: "4"
+            - name: AIBROKER_BROWSER_MAX_SESSIONS
+              value: "20"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8090
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8090
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 768Mi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 1Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aibroker-browser-worker
+  namespace: aibroker
+spec:
+  selector:
+    app: aibroker-browser-worker
+  ports:
+    - port: 8090
+      targetPort: 8090

@@ -1,0 +1,28 @@
+{
+  "name": "aibroker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "install:all": "corepack pnpm install",
+    "dev": "docker compose up --build",
+    "dev:api": "corepack pnpm --filter @aibroker/api dev",
+    "dev:web": "corepack pnpm --filter @aibroker/web dev",
+    "dev:worker": "corepack pnpm --filter @aibroker/worker dev",
+    "db:migrate": "corepack pnpm --filter @aibroker/db migrate",
+    "db:seed": "corepack pnpm --filter @aibroker/db seed",
+    "test": "corepack pnpm -r test",
+    "test:api": "corepack pnpm --filter @aibroker/api test",
+    "test:web": "corepack pnpm --filter @aibroker/web test",
+    "test:packages": "corepack pnpm --filter './packages/**' test",
+    "typecheck": "corepack pnpm -r typecheck",
+    "lint": "corepack pnpm -r lint"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2",
+    "tsx": "^4.19.2",
+    "vitest": "^2.1.8"
+  }
+}

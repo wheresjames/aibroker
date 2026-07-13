@@ -1,0 +1,27 @@
+image:
+  api: aibroker-api:latest
+  web: aibroker-web:latest
+  worker: aibroker-worker:latest
+  browserWorker: aibroker-browser-worker:latest
+
+host: aibroker.example.com
+tlsSecretName: aibroker-tls
+
+secrets:
+  databaseUrl: postgres://aibroker:change-me@postgres:5432/aibroker
+  redisUrl: redis://redis:6379
+  sessionSecret: replace-me
+  encryptionKeyBase64: replace-me
+  browserWorkerSecret: replace-me
+  artifactS3Endpoint: https://s3.example.com
+  artifactS3Region: eu-central-1
+  artifactS3Bucket: aibroker-artifacts
+  artifactS3AccessKeyId: replace-me
+  artifactS3SecretAccessKey: replace-me
+
+features:
+  mcpEnabled: true
+
+browser:
+  maxConcurrent: 4
+  maxSessions: 20

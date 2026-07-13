@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+tool="${1:-}"; shift || true
+artifact_dir="${AIBROKER_ARTIFACT_DIR:-/var/lib/aibroker/artifacts}"
+wp_cli=wp; wordpress_path=""; id=""; kind=combined; name=""; search=""; replace=""; network=false; retention_days=""
+for arg in "$@"; do
+  key="${arg%%=*}"; value="${arg#*=}"
+  case "$key" in
+    --wp-cli) wp_cli="$value";; --wordpress-path) wordpress_path="$value";; --id) id="$value";; --kind) kind="$value";; --name) name="$value";;
+    --search) search="$value";; --replace) replace="$value";; --network) network="$value";; --retention-days) retention_days="$value";;
+    --backup-id) id="$value";; *) echo "Unknown argument" >&2; exit 64;;
+  esac
+done
+[[ "$wp_cli" =~ ^[A-Za-z0-9_./-]+$ ]] || { echo "Invalid WP-CLI path" >&2; exit 64; }
+[[ -z "$wordpress_path" || "$wordpress_path" = /* ]] || { echo "Invalid WordPress path" >&2; exit 64; }
+wp=("$wp_cli"); [[ -n "$wordpress_path" ]] && wp+=("--path=$wordpress_path")
+mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
+new_id(){ cat /proc/sys/kernel/random/uuid; }
+valid_id(){ [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]; }
+json_artifact(){ local file="$1"; local sum size; sum="$(sha256sum "$file"|cut -d' ' -f1)"; size="$(stat -c %s "$file")"; printf '{"storage_reference":"%s","checksum_sha256":"%s","size_bytes":%s}\n' "$file" "$sum" "$size"; }
+
+case "$tool" in
+  backup_create|deployment_snapshot_create)
+    uid="$(new_id)"; target="$artifact_dir/$uid"; mkdir -m 700 "$target"
+    if [[ "$kind" == database || "$kind" == combined || "$tool" == deployment_snapshot_create ]]; then "${wp[@]}" db export "$target/database.sql" --quiet; fi
+    if [[ "$kind" == filesystem || "$kind" == combined || "$tool" == deployment_snapshot_create ]]; then
+      [[ -n "$wordpress_path" ]] || { echo "WordPress path required" >&2; exit 64; }
+      tar --one-file-system --exclude="$artifact_dir" -czf "$target/files.tar.gz" -C "$wordpress_path" .
+    fi
+    tar -czf "$artifact_dir/$uid.tar.gz" -C "$target" .; rm -rf "$target"; json_artifact "$artifact_dir/$uid.tar.gz";;
+  backup_list) find "$artifact_dir" -maxdepth 1 -name '*.tar.gz' -printf '%f\n' | head -500 | sed 's/.tar.gz$//' | awk 'BEGIN{print "["}{printf "%s{\"id\":\"%s\"}",NR==1?"":",",$0}END{print "]"}';;
+  backup_get) valid_id "$id" || exit 64; json_artifact "$artifact_dir/$id.tar.gz";;
+  backup_verify) valid_id "$id" || exit 64; tar -tzf "$artifact_dir/$id.tar.gz" >/dev/null; json_artifact "$artifact_dir/$id.tar.gz";;
+  backup_delete) valid_id "$id" || exit 64; rm -f "$artifact_dir/$id.tar.gz"; printf '{"deleted":true}\n';;
+  backup_restore|deployment_snapshot_restore|database_restore_snapshot)
+    valid_id "$id" || exit 64; stage="$(mktemp -d)"; trap 'rm -rf "$stage"' EXIT; tar -xzf "$artifact_dir/$id.tar.gz" -C "$stage"
+    [[ -f "$stage/database.sql" ]] && "${wp[@]}" db import "$stage/database.sql"
+    if [[ -f "$stage/files.tar.gz" ]]; then [[ -n "$wordpress_path" ]] || exit 64; tar -xzf "$stage/files.tar.gz" -C "$wordpress_path"; fi
+    printf '{"restored":true}\n';;
+  database_check) "${wp[@]}" db check; printf '{"checked":true}\n';;
+  database_optimize) "${wp[@]}" db optimize; printf '{"optimized":true}\n';;
+  database_export) uid="$(new_id)"; file="$artifact_dir/$uid.sql"; "${wp[@]}" db export "$file" --quiet; json_artifact "$file";;
+  database_import) valid_id "$id" || exit 64; "${wp[@]}" db import "$artifact_dir/$id.sql"; printf '{"imported":true}\n';;
+  database_list_tables) "${wp[@]}" db size --tables --format=json;;
+  database_search_replace_preview|database_search_replace)
+    args=(search-replace "$search" "$replace" --precise --report-changed-only --format=json); [[ "$tool" == *_preview ]] && args+=(--dry-run); [[ "$network" == true ]] && args+=(--network --all-tables-with-prefix); "${wp[@]}" "${args[@]}";;
+  *) echo "Unsupported recovery tool" >&2; exit 64;;
+esac
