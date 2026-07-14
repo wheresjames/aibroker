@@ -31,6 +31,7 @@ policy, or unbind a server and every affected client's behavior changes in one p
 - [Production operations](#production-operations)
 - [Project layout](#project-layout)
 - [Further reading](#further-reading)
+- [Comparison to similar projects](#comparison-to-similar-projects)
 
 ---
 
@@ -637,3 +638,213 @@ dev.sh        developer entrypoint (run/test/migrate/seed/wptest/…)
 
 AIBroker is for authorized WordPress operations and security testing on servers you
 administer. Don't use it to access servers you don't own.
+
+---
+
+## Comparison to similar projects
+
+The projects below overlap with AIBroker in different ways. Some are general MCP hosting
+platforms, some federate existing MCP servers, and some concentrate on filtering traffic.
+The right choice depends mainly on whether you need to **run arbitrary MCP servers** or
+want a broker to provide a **small, controlled set of infrastructure operations**.
+
+This comparison is based on the projects' public documentation and repositories. Features
+and licensing can change, so verify the linked project before making a production decision.
+
+---
+
+### Obot
+
+[Obot](https://github.com/obot-platform/obot) is a self-hosted MCP platform that combines
+server hosting, a registry, a gateway, an agent/chat client, and an administrative UI. It
+can run stdio and HTTP MCP servers with Docker or Kubernetes and supports OAuth, users,
+groups, access policies, audit logs, and per-user or shared credentials.
+
+Key differences:
+
+- Obot hosts and proxies general-purpose MCP servers; AIBroker implements a smaller catalog
+  of server-management tools itself.
+- Obot access policies primarily decide which users or groups can access an MCP server.
+  AIBroker policies operate at individual tool level and add risk ceilings, constraints,
+  explicit denies, and per-instance overrides.
+- Obot includes model configuration, chat, RAG, memory, workflows, scheduling, registry
+  discovery, and GitOps-managed server definitions. AIBroker does not try to be an agent or
+  chat platform.
+- Obot's Kubernetes deployment is the more suitable of its runtimes for untrusted MCP code;
+  its own documentation describes the Docker runtime as appropriate for development or
+  trusted, single-tenant use. AIBroker does not accept arbitrary MCP server packages to run.
+- Obot is a substantially larger and more established project. AIBroker has a narrower
+  integration set and a smaller community.
+
+Choose Obot if you need an organization-wide MCP catalog, arbitrary server hosting, OAuth
+integration, external and built-in chat clients, or Kubernetes-based multi-user operation.
+
+Choose AIBroker if the required tools are among its supported WordPress, PostgreSQL, SSH,
+and browser operations and you prefer those operations to be constrained and governed by
+the broker instead of installing a separate general-purpose MCP server for each system.
+
+---
+
+### ToolHive
+
+[ToolHive](https://github.com/stacklok/toolhive) runs MCP servers in isolated containers and
+provides a gateway, registry, policy enforcement, identity integration, audit logging,
+observability, a desktop workflow, and a Kubernetes operator.
+
+Key differences:
+
+- ToolHive is an MCP runtime and platform for existing or third-party servers. AIBroker's
+  plugins define both the exposed tools and how privileged operations are executed.
+- ToolHive has stronger general server isolation and lifecycle management, including a
+  Kubernetes operator. AIBroker currently has deployment manifests but is not a general MCP
+  workload orchestrator.
+- ToolHive offers OIDC/OAuth integration, OpenTelemetry, Prometheus metrics, and a broader
+  client and registry ecosystem. AIBroker currently uses its own account, session, and token
+  model and has a smaller operational footprint.
+- AIBroker has domain-specific controls such as scoped PostgreSQL roles, confined SSH
+  identities, exact-origin browser access, and explicit break-glass tools. Comparable safety
+  in ToolHive depends on the selected MCP server and its policy and container configuration.
+- ToolHive is more mature and has a larger contributor and release ecosystem.
+
+Choose ToolHive if you want a general secure runtime for a fleet of MCP servers, especially
+on Kubernetes, or need standard identity and observability integrations.
+
+Choose AIBroker if you do not need arbitrary MCP hosting and value the built-in provisioning
+and policy semantics for the particular infrastructure systems it supports.
+
+---
+
+### ContextForge
+
+[IBM ContextForge](https://github.com/IBM/mcp-context-forge) is a registry and gateway that
+federates MCP and A2A servers as well as REST and gRPC APIs. It provides authentication,
+SSO, RBAC, plugins, rate limiting, caching, observability, and multi-gateway federation.
+
+Key differences:
+
+- ContextForge is primarily a protocol federation and governance layer. It can turn several
+  kinds of upstream service into a unified tool surface; AIBroker directly implements its
+  supported infrastructure connectors.
+- ContextForge supports more protocols, identity providers, plugins, and observability
+  backends and is designed for larger, distributed gateway deployments.
+- AIBroker's policy model is tied to users or groups, target server instances, plugin tools,
+  risk levels, and operation-specific constraints. ContextForge provides broader gateway
+  controls but does not give every upstream tool the same domain-specific confinement.
+- ContextForge has more configuration and operational surface area. That flexibility is
+  useful for heterogeneous estates but may be unnecessary for a small set of managed hosts.
+
+Choose ContextForge if the main requirement is to federate many existing MCP servers, agents,
+and APIs behind shared discovery, SSO, routing, and observability.
+
+Choose AIBroker if the main requirement is tightly scoped administrative access to its
+supported server types and the upstream systems should never receive client-held privileged
+credentials.
+
+---
+
+### MCP Gateway Registry
+
+[MCP Gateway Registry](https://github.com/agentic-community/mcp-gateway-registry) combines a
+curated organizational registry with a gateway, authentication, credential providers, audit
+trails, and fine-grained control over which MCP assets users can discover and access.
+
+Key differences:
+
+- MCP Gateway Registry starts from an inventory of independently developed MCP servers and
+  other AI assets. AIBroker starts from registered target machines and configured plugin
+  instances.
+- The registry project is better suited to organization-wide discovery, publishing, search,
+  and governance across a large MCP estate.
+- It integrates with external identity systems such as Keycloak and supports cloud-oriented
+  deployment options. AIBroker currently provides local users, roles, groups, and tokens.
+- AIBroker goes deeper into the execution path of its built-in operations, including
+  credential bootstrap, typed database access, origin-restricted browsing, and captured
+  break-glass execution.
+
+Choose MCP Gateway Registry if teams already operate MCP servers and need a controlled catalog,
+enterprise identity integration, discovery, and a common gateway in front of them.
+
+Choose AIBroker if users should be granted operations on registered infrastructure targets
+rather than access to a catalog of independently operated MCP servers.
+
+---
+
+### mcp-firewall
+
+[mcp-firewall](https://github.com/ressl/mcp-firewall) is an inline security proxy for MCP. It
+wraps an existing server and applies agent RBAC, allow/deny policy, threat detection, output
+checks, rate controls, and tamper-evident audit logging.
+
+Key differences:
+
+- mcp-firewall is deliberately a focused enforcement layer and can be placed in front of many
+  existing MCP servers. It does not aim to manage target hosts, provision scoped identities,
+  or provide AIBroker's user and server administration model.
+- Its security checks cover threats such as suspicious inputs, secret leakage, SSRF, and tool
+  behavior. AIBroker relies more heavily on narrow tool schemas, target constraints, scoped
+  credentials, and isolation at the connector level.
+- mcp-firewall is easier to introduce when an MCP deployment already exists. Adopting
+  AIBroker means using or developing an AIBroker plugin for the target system.
+- AIBroker includes a web administration and self-service experience; mcp-firewall is better
+  understood as a composable security component.
+
+Choose mcp-firewall if you already have MCP servers and want a lightweight, defense-in-depth
+policy and inspection layer without replacing them.
+
+Choose AIBroker if you also need centralized target registration, credential custody, user and
+group bindings, and implementations of the privileged tools themselves.
+
+---
+
+### Unified MCP Gateway
+
+[Unified MCP Gateway](https://github.com/SidPad03/unified-mcp-gateway) provides one endpoint
+for multiple MCP backends with API keys, RBAC, tool-level allow/deny policies, audit logging,
+payload redaction, and support for remotely connected servers.
+
+Key differences:
+
+- Unified MCP Gateway is closer to a conventional reverse proxy: backends supply the tools,
+  while the gateway authenticates, authorizes, routes, and records calls.
+- AIBroker couples policy metadata to a plugin catalog and contains connector implementations,
+  credential encryption, scoped identity provisioning, queues, and artifact handling.
+- Unified MCP Gateway can be the simpler fit for aggregating existing MCP endpoints. AIBroker's
+  extra data model and supporting services are useful only when its target-centric governance
+  is required.
+- Unified MCP Gateway is a younger project with a smaller deployment record; evaluate its
+  release cadence, tests, and security model for the intended environment. AIBroker is also
+  pre-1.0 and should receive the same scrutiny.
+
+Choose Unified MCP Gateway if the goal is a relatively direct, multi-user policy gateway in
+front of MCP servers you already operate.
+
+Choose AIBroker if the gateway must also own scoped infrastructure credentials and enforce
+operation-specific safety inside its connectors.
+
+---
+
+### Docker MCP Gateway
+
+[Docker MCP Gateway](https://github.com/docker/mcp-gateway) aggregates and runs containerized
+MCP servers. It supports catalogs, tool selection, secret injection, resource limits, network
+restrictions, and controls intended to prevent secrets from crossing tool boundaries.
+
+Key differences:
+
+- Docker MCP Gateway is primarily an MCP runtime and protocol bridge associated with the
+  Docker toolchain. It is convenient for assembling local or container-based tool sets.
+- It does not provide AIBroker's full multi-user administration model of groups, policies,
+  target-server bindings, role-scoped UI, and administrative audit events.
+- Container boundaries and network controls make Docker MCP Gateway a better general choice
+  for running third-party MCP server code. AIBroker avoids running such code but supports only
+  its installed plugins.
+- AIBroker stores and provisions credentials for target infrastructure and can constrain an
+  operation below the process/container boundary. Docker MCP Gateway's effective permissions
+  still depend on each server, its injected credentials, and its runtime configuration.
+
+Choose Docker MCP Gateway if you want to compose and isolate MCP servers with Docker, mainly
+for individual developers or a container-centered deployment.
+
+Choose AIBroker if you need centrally administered access for multiple users to a fixed set of
+registered infrastructure targets, with per-call policy decisions and an application-level
+audit trail.
