@@ -1,6 +1,7 @@
 import React from "react";
 import { createPortal } from "react-dom";
 import { navItems, canAccessNav, ADMIN_ROLES } from "./nav-access.js";
+import { RemoteBrowserCapture, type CaptureFrame } from "./capture.js";
 import type {
   User, Server, ServerPlugin, PluginType, Group, GroupMembership, Token, ToolDefinition, Policy, PolicyPermission, PolicyPluginIntent, AccessLevel, Binding,
   EffectiveAccess, AuditEvent, MyActivity, McpSession, McpTrafficEvent, SandboxTarget, ThemeMode, ToastTone, ToastItem, SelectItem, ComboboxOption, ZxcvbnModule, Api, Runner
@@ -942,6 +943,112 @@ export function HostAccess(props: { api: Api; run: Runner }) {
   </section>;
 }
 
+interface WordPressSessionRow {
+  server_plugin_id: string; instance_name: string; server_name: string;
+  state: "not_connected" | "connected" | "expiring_soon" | "expired";
+  expires_at: string | null; last_used_at: string | null; wp_user_name: string | null; roles: string[]; privileged: boolean;
+}
+
+const SESSION_STATE_LABELS: Record<WordPressSessionRow["state"], string> = {
+  not_connected: "Not connected", connected: "Connected", expiring_soon: "Expires soon", expired: "Expired"
+};
+
+// Self-service WordPress login sessions (AB-ELEMENTOR 4.1). The password goes to the
+// broker once for a background login and is never stored; only the cookies are kept.
+// Two-factor codes are relayed (D6); anything else can use the live browser (D7).
+type ConnectStep =
+  | { kind: "password"; row: WordPressSessionRow }
+  | { kind: "two_factor"; row: WordPressSessionRow; captureId: string; message: string }
+  | { kind: "browser"; row: WordPressSessionRow; captureId: string; frame: CaptureFrame };
+
+export function WordPressSessions(props: { api: Api; run: Runner }) {
+  const [rows, setRows] = React.useState<WordPressSessionRow[]>([]);
+  const [step, setStep] = React.useState<ConnectStep | null>(null);
+  const [form, setForm] = React.useState({ username: "", password: "", code: "" });
+  const [notice, setNotice] = React.useState("");
+  const [problem, setProblem] = React.useState<{ message: string; browser: boolean } | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const load = React.useCallback(async () => {
+    const body = await props.api<{ sessions: WordPressSessionRow[] }>("/me/wordpress-sessions");
+    setRows(body.sessions);
+  }, [props.api]);
+  React.useEffect(() => { void load(); }, [load]);
+  const connected = async (body: { warning?: string }) => {
+    setNotice(body.warning ?? "Connected.");
+    setStep(null); setProblem(null); setForm({ username: "", password: "", code: "" });
+    await load();
+  };
+  const attempt = async (work: () => Promise<void>) => {
+    setBusy(true); setProblem(null);
+    try { await work(); }
+    catch (err) {
+      const body = (err as { body?: { error?: string; message?: string; capture_id?: string; browser_login?: boolean } }).body ?? {};
+      if (body.error === "two_factor_required" && body.capture_id && step) {
+        setStep({ kind: "two_factor", row: step.row, captureId: body.capture_id, message: body.message ?? "Enter your two-factor code." });
+      } else {
+        setProblem({ message: err instanceof Error ? err.message : "Could not connect.", browser: body.browser_login === true });
+      }
+    } finally { setBusy(false); setForm((current) => ({ ...current, password: "", code: "" })); }
+  };
+  const submitPassword = (row: WordPressSessionRow) => attempt(async () => {
+    await connected(await props.api<{ warning?: string }>("/me/wordpress-sessions", {
+      method: "POST", body: JSON.stringify({ server_plugin_id: row.server_plugin_id, username: form.username, password: form.password })
+    }));
+  });
+  const submitCode = (captureId: string) => attempt(async () => {
+    await connected(await props.api<{ warning?: string }>("/me/wordpress-sessions/two-factor", { method: "POST", body: JSON.stringify({ capture_id: captureId, code: form.code }) }));
+  });
+  const startBrowser = (row: WordPressSessionRow) => attempt(async () => {
+    const body = await props.api<{ capture_id: string; frame: CaptureFrame }>("/me/wordpress-sessions/browser", { method: "POST", body: JSON.stringify({ server_plugin_id: row.server_plugin_id }) });
+    setStep({ kind: "browser", row, captureId: body.capture_id, frame: body.frame });
+  });
+  const disconnect = async (row: WordPressSessionRow) => {
+    if (await props.run("Disconnect WordPress session", async () => { await props.api(`/me/wordpress-sessions/${row.server_plugin_id}`, { method: "DELETE" }); })) await load();
+  };
+  const cancel = () => { setStep(null); setProblem(null); setForm({ username: "", password: "", code: "" }); };
+  return <section className="page-section">
+    <div className="page-header"><div><h2 className="page-header-title">WordPress Sessions</h2>
+      <p className="page-header-sub">Connect your own WordPress login so AI page-builder tools can save draft previews and refresh Elementor after edits. Your password is used to log in and is never stored.</p></div></div>
+    {notice ? <div className="inline-notice inline-notice-warning"><span>{notice}</span></div> : null}
+    {step ? <div className="panel">
+      <h3>Log in to {step.row.server_name} ({step.row.instance_name})</h3>
+      {problem ? <div className="inline-notice inline-notice-error"><span>{problem.message}</span>
+        {problem.browser ? <button onClick={() => void startBrowser(step.row)}>Log in with browser</button> : null}</div> : null}
+      {step.kind === "password" ? <>
+        <p className="muted">Sessions last about 14 days. Two-factor codes from Two Factor, Wordfence and WP 2FA are supported; for CAPTCHAs or single sign-on use "Log in with browser".</p>
+        <label className="modal-field"><span>WordPress username or email</span><input autoComplete="off" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} /></label>
+        <label className="modal-field"><span>Password</span><input type="password" autoComplete="off" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></label>
+        <div className="cell-actions">
+          <button className="button-primary" disabled={busy || !form.username || !form.password} onClick={() => void submitPassword(step.row)}>Connect</button>
+          <button disabled={busy} onClick={() => void startBrowser(step.row)}>Log in with browser</button>
+          <button onClick={cancel}>Cancel</button>
+        </div>
+      </> : null}
+      {step.kind === "two_factor" ? <>
+        <p className="muted">{step.message}</p>
+        <label className="modal-field"><span>Verification code</span><input autoComplete="one-time-code" inputMode="numeric" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} /></label>
+        <div className="cell-actions">
+          <button className="button-primary" disabled={busy || !form.code} onClick={() => void submitCode(step.captureId)}>Verify</button>
+          <button onClick={() => { void props.api(`/me/login-captures/${step.captureId}`, { method: "DELETE" }).catch(() => undefined); cancel(); }}>Cancel</button>
+        </div>
+      </> : null}
+      {step.kind === "browser" ? <RemoteBrowserCapture api={props.api} captureId={step.captureId} initialFrame={step.frame} mode="auto"
+        onDone={(result) => void connected(result as { warning?: string })} onCancel={cancel} /> : null}
+    </div> : null}
+    <DataTable columns={["server", "status", "wordpress_user", "expires", "actions"]} rows={rows.map((row) => ({
+      id: row.server_plugin_id,
+      server: `${row.server_name} — ${row.instance_name}`,
+      status: SESSION_STATE_LABELS[row.state],
+      wordpress_user: row.wp_user_name ? `${row.wp_user_name}${row.roles.length ? ` (${row.roles.join(", ")})` : ""}${row.privileged ? " ⚠ administrator" : ""}` : "—",
+      expires: row.expires_at && row.state !== "not_connected" ? new Date(row.expires_at).toLocaleString() : "—",
+      actions: <div className="cell-actions">
+        <button onClick={() => { setNotice(""); setProblem(null); setStep({ kind: "password", row }); }}>{row.state === "not_connected" ? "Connect" : "Reconnect"}</button>
+        {row.state !== "not_connected" ? <button onClick={() => void disconnect(row)}>Disconnect</button> : null}
+      </div>
+    }))} />
+  </section>;
+}
+
 export function Operations(props:{api:Api}){
   const[data,setData]=React.useState<{operations:Array<Record<string,unknown>>;backups:Array<Record<string,unknown>>;restores:Array<Record<string,unknown>>;deployments:Array<Record<string,unknown>>;providers:Array<Record<string,unknown>>}>({operations:[],backups:[],restores:[],deployments:[],providers:[]});const[networks,setNetworks]=React.useState<Array<Record<string,unknown>>>([]);const[error,setError]=React.useState("");
   React.useEffect(()=>{void Promise.all([props.api<typeof data>("/admin/recovery"),props.api<{networks:Array<Record<string,unknown>>}>("/admin/networks")]).then(([recovery,network])=>{setData(recovery);setNetworks(network.networks);}).catch(err=>setError(err instanceof Error?err.message:"Failed to load operations"));},[props.api]);
@@ -1061,6 +1168,7 @@ function PluginConfigFields(props: { type: PluginType | undefined; config: Recor
     const update = (next: string) => props.setConfig({ ...props.config, [key]: next });
     if (schema.enum) return <label key={key}><span>{schema.title ?? key}</span><select value={value} onChange={(event) => update(event.target.value)}>{schema.enum.map((option) => <option key={option}>{option}</option>)}</select></label>;
     if (schema.type === "array") return <label key={key}><span>{schema.title ?? key}</span><textarea value={value} placeholder="One value per line" onChange={(event) => update(event.target.value)} /></label>;
+    if (schema.type === "boolean") return <label key={key} title={schema.description}><input type="checkbox" checked={value === "true"} onChange={(event) => update(event.target.checked ? "true" : "false")} /> {schema.title ?? key}</label>;
     return <label key={key}><span>{schema.title ?? key}</span><input type={schema.type === "integer" ? "number" : key.includes("url") ? "url" : "text"} value={value} onChange={(event) => update(event.target.value)} /></label>;
   })}</>;
 }
@@ -1146,8 +1254,9 @@ function ServerPlugins(props: { server: Server; api: Api; run: Runner }) {
   const [testingPluginId, setTestingPluginId] = React.useState<string | null>(null);
   const [modal, setModal] = React.useState<"add" | "edit" | "credential" | "disable" | "remove" | "provision" | "deprovision" | null>(null);
   const [selected, setSelected] = React.useState<ServerPlugin | null>(null);
-  const [form, setForm] = React.useState({ plugin_key: "wordpress", instance_name: "WordPress", config: { base_url: "http://${server.address}", wordpress_path: "", wp_cli_path: "wp" } as Record<string, string> });
+  const [form, setForm] = React.useState({ plugin_key: "wordpress", instance_name: "WordPress", config: { base_url: "https://${server.address}", wordpress_path: "", wp_cli_path: "wp" } as Record<string, string> });
   const [credential, setCredential] = React.useState({ username: "", application_password: "", storage_state: "" });
+  const [browserCapture, setBrowserCapture] = React.useState<{ captureId: string; frame: CaptureFrame } | null>(null);
   const [disableReason, setDisableReason] = React.useState("");
   const [removeConfirmed, setRemoveConfirmed] = React.useState(false);
   const [preview, setPreview] = React.useState<{ profile: { username: string; workspaceRoot: string; authorizedKeyPath: string; forceCommand: string; sudoersLines: string[] }; summary: string[] } | null>(null);
@@ -1216,7 +1325,7 @@ function ServerPlugins(props: { server: Server; api: Api; run: Runner }) {
               ? { plugin_key: key, instance_name: "Postgres", config: { host: "${server.address}", port: "5432", database: "postgres", scoped_role: "aibroker_scoped", allowed_schemas: "public", named_queries: "{}" } }
               : key === "playwright"
                 ? { plugin_key: key, instance_name: "Browser", config: { base_url: `https://${props.server.address}`, allowed_origins: `https://${props.server.address}`, allowed_path_prefixes: "", viewport_width: "1440", viewport_height: "900", locale: "en-US", timezone: "UTC", color_scheme: "no-preference", artifact_retention_seconds: "86400" } }
-                : { plugin_key: key, instance_name: "WordPress", config: { base_url: "http://${server.address}", wordpress_path: "", wp_cli_path: "wp" } });
+                : { plugin_key: key, instance_name: "WordPress", config: { base_url: "https://${server.address}", wordpress_path: "", wp_cli_path: "wp" } });
         }}>
           {types.map((type) => <option key={type.key} value={type.key}>{type.name}</option>)}
         </select>
@@ -1277,7 +1386,17 @@ function ServerPlugins(props: { server: Server; api: Api; run: Runner }) {
         <PluginConfigFields type={types.find((type) => type.key === selected.plugin_key)} config={form.config} setConfig={(config) => setForm({ ...form, config })} />
       </Form>
     </Modal> : null}
-    {modal === "credential" && selected ? <Modal title={`Credential · ${selected.instance_name}`} onClose={closeCredential}>
+    {modal === "credential" && selected && browserCapture ? <Modal title={`Log in · ${selected.instance_name}`} onClose={() => setBrowserCapture(null)}>
+      <RemoteBrowserCapture api={props.api} captureId={browserCapture.captureId} initialFrame={browserCapture.frame} mode="manual"
+        onDone={() => { setBrowserCapture(null); closeCredential(); void load(); }} onCancel={() => setBrowserCapture(null)} />
+    </Modal> : null}
+    {modal === "credential" && selected && !browserCapture ? <Modal title={`Credential · ${selected.instance_name}`} onClose={closeCredential}>
+      {selected.plugin_key === "playwright" ? <div className="cell-actions">
+        <button onClick={() => void props.run("Start browser login", async () => {
+          const body = await props.api<{ capture_id: string; frame: CaptureFrame }>(`/admin/servers/${props.server.id}/plugins/${selected.id}/credential/capture`, { method: "POST", body: JSON.stringify({}) });
+          setBrowserCapture({ captureId: body.capture_id, frame: body.frame });
+        })}>Log in with browser instead</button>
+      </div> : null}
       <Form submitLabel={selected.has_active_credential ? "Replace credential" : "Save credential"} onCancel={closeCredential} onSubmit={async () => {
         const ok = await props.run("Save credential", async () => {
           const body = selected.plugin_key === "playwright"
@@ -2658,8 +2777,11 @@ export function ClientSetup(props: { secret: string; user: User; myTokens: Token
     servers: { [name]: { type: "http", url, headers: { Authorization: `Bearer ${displayToken}` } } }
   }, null, 2);
   const codexToml = `[mcp_servers.${name}]
-url = "${url}"
+url = ${JSON.stringify(url)}
 bearer_token_env_var = "AIBROKER_TOKEN"`;
+  const codexDirectToml = `[mcp_servers.${name}]
+url = ${JSON.stringify(url)}
+http_headers = { Authorization = ${JSON.stringify(`Bearer ${displayToken}`)} }`;
   const codexCli = `codex mcp add ${name} --url ${url} --bearer-token-env-var=AIBROKER_TOKEN
 export AIBROKER_TOKEN=${displayToken}`;
 
@@ -2747,8 +2869,10 @@ export AIBROKER_TOKEN=${displayToken}`;
         ) : null}
         {tab === "codex" ? (
           <>
-            <ConfigBlock title="Add with the CLI" code={codexCli} note="Codex reads the token from an env var — a plain bearer_token is rejected. Export AIBROKER_TOKEN in your shell rc after adding the server." />
-            <ConfigBlock title="…or edit ~/.codex/config.toml" code={codexToml} note="Transport is auto-detected from the url field (streamable HTTP)." />
+            <ConfigBlock title="Option 1: Store the token directly in ~/.codex/config.toml" code={codexDirectToml} note="Uses a fixed Authorization header, so no environment variable is needed. Replace this server's existing config block and remove bearer_token_env_var if present. The token is stored in plaintext; keep it in your personal config rather than a committed project file." />
+            <ConfigBlock title="Option 2: Use an environment variable — CLI setup" code={codexCli} note="Export AIBROKER_TOKEN in the same terminal before starting Codex. An export in another terminal does not update an already-running CLI, desktop app, or IDE." />
+            <ConfigBlock title="Environment variable option — ~/.codex/config.toml" code={codexToml} note="Alternative to the CLI setup above. Remove a fixed Authorization header if switching to this option. Codex must inherit AIBROKER_TOKEN when it starts; a plain bearer_token field is not supported." />
+            <p className="config-note">Choose one authentication option, restart Codex, then run <code>/mcp</code> to check that the server connected and tools are available.</p>
           </>
         ) : null}
         {tab === "other" ? (

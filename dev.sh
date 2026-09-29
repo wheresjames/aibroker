@@ -38,7 +38,7 @@ Usage:
   ./dev.sh seed              Build a one-off API container and seed tools/local admin
   ./dev.sh db-setup          Run migrations and seeding in one command
   ./dev.sh down              Stop all AIBroker Docker services
-  ./dev.sh logs              Follow Docker service logs
+  ./dev.sh logs              Follow full, unfiltered Docker service logs
   ./dev.sh backup            Create a local PostgreSQL backup using AIBROKER_DATABASE_URL
   ./dev.sh k3s-smoke         Run k3s deployment smoke checks
   ./dev.sh help              Show this help
@@ -48,6 +48,10 @@ Primary inspection URLs after run/run-image:
   API live health:    http://localhost:8080/health/live
   API ready health:   http://localhost:8080/health/ready
   WordPress:          http://localhost:8081
+
+Console logs hide routine HTTP request starts and successful completions.
+Full run output is saved to data/logs/compose-*.log (not automatically rotated).
+Use AIBROKER_CONSOLE_LOGS=full ./dev.sh run for unfiltered console output.
 EOF
 }
 
@@ -246,12 +250,28 @@ cleanup_stack() {
   exit "$code"
 }
 
+compose_foreground() {
+  local log_file
+  mkdir -p data/logs
+  log_file="$(mktemp "${ROOT_DIR}/data/logs/compose-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")"
+  echo "Full stack log: ${log_file}"
+  if [[ "${AIBROKER_CONSOLE_LOGS:-quiet}" == "full" ]]; then
+    docker_compose up "$@" 2>&1 | tee -a "$log_file"
+  elif have node; then
+    echo "Console: routine HTTP requests hidden; use ./dev.sh logs for full service logs."
+    docker_compose up --no-color "$@" 2>&1 | tee -a "$log_file" | node scripts/console-log-filter.mjs
+  else
+    echo "Node.js unavailable; showing full console logs."
+    docker_compose up "$@" 2>&1 | tee -a "$log_file"
+  fi
+}
+
 run_stack() {
   ensure_env
   ensure_data_dirs
   require_cmd docker
   trap cleanup_stack INT TERM EXIT
-  docker_compose up --build
+  compose_foreground --build
 }
 
 build_images() {
@@ -265,7 +285,7 @@ run_images() {
   ensure_data_dirs
   require_cmd docker
   trap cleanup_stack INT TERM EXIT
-  docker_compose up --no-build
+  compose_foreground --no-build
 }
 
 # Run the full AIBroker stack in the foreground AND bring up a named WordPress
@@ -302,7 +322,7 @@ run_stack_and_wptest() {
   echo "Starting the AIBroker stack with WordPress test site '${WPT_FG_NAME}'."
   echo "Press Ctrl+C to stop everything."
   echo "------------------------------------------------------------"
-  docker_compose up --build
+  compose_foreground --build
   combined_cleanup
 }
 

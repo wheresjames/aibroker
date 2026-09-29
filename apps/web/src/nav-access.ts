@@ -14,6 +14,7 @@ export const navItems = [
   "Policies",
   "Audit Logs",
   "Host Access",
+  "WordPress Sessions",
   "Operations",
   "MCP",
   "Client Setup",
@@ -37,6 +38,8 @@ export const navAccess: Record<string, string[]> = {
   Policies: ADMIN_ROLES,
   "Audit Logs": ADMIN_ROLES,
   "Host Access": ALL_ROLES,
+  // Self-service: each user connects their own WordPress login for page-builder tools.
+  "WordPress Sessions": ALL_ROLES,
   Operations: ADMIN_ROLES,
   MCP: ADMIN_ROLES,
   "Client Setup": ALL_ROLES,

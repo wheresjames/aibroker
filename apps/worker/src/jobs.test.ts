@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { claimNextJob, isDurableJob, recoverInterruptedJobs, validateJobPayload } from "./jobs.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { claimNextJob, createJobRecovery, startJobHeartbeat, isDurableJob, recoverInterruptedJobs, validateJobPayload } from "./jobs.js";
 
 describe("job validation", () => {
   it("classifies write-adjacent connector jobs as durable", () => {
@@ -34,4 +34,36 @@ describe("job validation", () => {
     await expect(claimNextJob({ query: async () => ({ rows: [] }) })).resolves.toBeNull();
   });
   it("recovers stale durable work after a worker restart",async()=>{const sql:string[]=[];await recoverInterruptedJobs({query:async(statement)=>{sql.push(statement);return{};}});expect(sql.join(" ")).toContain("worker_restarted");expect(sql.join(" ")).toContain("host_operations");});
+});
+
+
+describe("worker recovery lifecycle", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("reconsiders interrupted jobs after the startup grace period", async () => {
+    vi.useFakeTimers();
+    const query = vi.fn(async () => ({}));
+    const recover = createJobRecovery({ query });
+    await recover();
+    expect(query).toHaveBeenCalledTimes(1);
+    await recover();
+    expect(query).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(300_001);
+    await recover();
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps long-running jobs alive and stops heartbeats on completion", async () => {
+    vi.useFakeTimers();
+    const query = vi.fn(async () => ({}));
+    const onError = vi.fn();
+    const stop = startJobHeartbeat({ query }, "job-1", onError);
+    await vi.advanceTimersByTimeAsync(360_000);
+    expect(query).toHaveBeenCalledTimes(12);
+    expect(query).toHaveBeenLastCalledWith(expect.stringContaining("status='running'"), ["job-1"]);
+    await stop();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(query).toHaveBeenCalledTimes(12);
+    expect(onError).not.toHaveBeenCalled();
+  });
 });

@@ -6,7 +6,7 @@ import type {
 } from "./types.js";
 import { toolNames, readSession, writeSession, clearSession, initialTheme, applyTheme } from "./helpers.js";
 import { ThemeSelector, ToastFooter, AccessDenied } from "./components.js";
-import { Login, ChangePassword, Settings, Dashboard, Users, Groups, Servers, Sandbox, Tokens, Policies, Audit, HostAccess, Operations, Mcp, ClientSetup } from "./pages.js";
+import { Login, ChangePassword, Settings, Dashboard, Users, Groups, Servers, Sandbox, Tokens, Policies, Audit, HostAccess, WordPressSessions, Operations, Mcp, ClientSetup } from "./pages.js";
 
 export function App() {
   const [active, setActive] = React.useState(navItems[0]);
@@ -54,7 +54,8 @@ export function App() {
           clearSession();
           setUser(null);
         }
-        throw new Error(body.message || body.error || `Request failed: ${response.status}`);
+        // Keep the status and body so callers can act on structured errors (e.g. capture_id).
+        throw Object.assign(new Error(body.message || body.error || `Request failed: ${response.status}`), { status: response.status, body });
       }
       return body as T;
     },
@@ -228,6 +229,8 @@ export function App() {
           <button
             type="button"
             onClick={() => {
+              // Revoke the session server-side; sign out locally even if that fails.
+              if (user) void fetch("/auth/logout", { method: "POST", headers: { "x-aibroker-session": user.session_token } }).catch(() => undefined);
               setUser(null);
               setPasswordChangeUser(null);
               setSecret("");
@@ -269,6 +272,7 @@ export function App() {
               ) : null}
               {active === "Audit Logs" ? <Audit events={state.auditEvents} /> : null}
               {active === "Host Access" ? <HostAccess api={api} run={run} /> : null}
+              {active === "WordPress Sessions" ? <WordPressSessions api={api} run={run} /> : null}
               {active === "Operations" ? <Operations api={api} /> : null}
               {active === "MCP" ? <Mcp api={api} servers={state.servers} user={user} notify={notify} /> : null}
               {active === "Client Setup" ? <ClientSetup secret={secret} user={user} myTokens={state.myTokens} defaultServerName={state.defaultServerName} /> : null}

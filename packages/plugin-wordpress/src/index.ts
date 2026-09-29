@@ -34,6 +34,37 @@ const accessLevels: AccessLevelMap = {
   }
 };
 
+const BOOLEAN_CONFIG = ["elementor_default_publish", "block_privileged_sessions"];
+
+// The admin form submits every field as a string; store booleans as booleans and keep
+// the session login path site-relative so it can never point the login elsewhere.
+export function normalizeWordPressConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...config };
+  for (const key of BOOLEAN_CONFIG) if (key in normalized) normalized[key] = normalized[key] === true || normalized[key] === "true";
+  if (normalized.login_extra_origins !== undefined) {
+    const raw = Array.isArray(normalized.login_extra_origins) ? normalized.login_extra_origins.map(String)
+      : String(normalized.login_extra_origins).split(/[\n,]/);
+    normalized.login_extra_origins = [...new Set(raw.map((value) => value.trim()).filter(Boolean).map((value) => {
+      let url: URL;
+      try { url = new URL(value); } catch { throw new Error("login_extra_origins must contain exact https origins without paths"); }
+      if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+        throw new Error("login_extra_origins must contain exact https origins without paths");
+      }
+      return url.origin;
+    }))];
+  }
+  if (typeof normalized.login_path === "string" && normalized.login_path.trim()) {
+    const path = normalized.login_path.trim();
+    if (!/^\/[A-Za-z0-9._~/-]*$/.test(path) || path.includes("..") || path.startsWith("//")) {
+      throw new Error("login_path must be a site-relative path such as /wp-login.php");
+    }
+    normalized.login_path = path;
+  } else {
+    delete normalized.login_path;
+  }
+  return normalized;
+}
+
 export const wordpressPlugin: BrokerPlugin = {
   key: "wordpress",
   name: "WordPress",
@@ -46,13 +77,22 @@ export const wordpressPlugin: BrokerPlugin = {
     type: "object",
     additionalProperties: false,
     properties: {
-      base_url: { type: "string", format: "uri", title: "Base URL", default: "http://${server.address}" },
+      base_url: { type: "string", format: "uri", title: "Base URL", default: "https://${server.address}" },
       wordpress_path: { type: "string", title: "WordPress path" },
-      wp_cli_path: { type: "string", title: "WP-CLI path", default: "wp" }
+      wp_cli_path: { type: "string", title: "WP-CLI path", default: "wp" },
+      login_path: { type: "string", title: "Login path", default: "/wp-login.php",
+        description: "Where users' WordPress session logins are sent; change it if the site renamed its login page." },
+      elementor_default_publish: { type: "boolean", title: "Elementor edits go live by default", default: false,
+        description: "When off, Elementor changes to published pages need publish: true or are saved as the user's draft preview." },
+      block_privileged_sessions: { type: "boolean", title: "Block administrator sessions", default: false,
+        description: "Refuse WordPress sessions for accounts that can manage options or install plugins." },
+      login_extra_origins: { type: "array", title: "Extra login origins", items: { type: "string" },
+        description: "Exact origins the live login browser may also load, e.g. a single sign-on provider. Common CAPTCHA providers are always allowed." }
     },
     required: ["base_url"]
   },
-  credentialKinds: ["wordpress_rest_application_password", "ssh_private_key"],
+  normalizeConfig(config) { return normalizeWordPressConfig(config); },
+  credentialKinds: ["wordpress_rest_application_password", "ssh_private_key", "wordpress_session"],
   domains: domains.map(([key, label]) => ({ key, label })),
   tools,
   accessLevels,

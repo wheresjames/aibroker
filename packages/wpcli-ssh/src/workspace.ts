@@ -23,14 +23,15 @@ export function buildWorkspaceCommand(options: WorkspaceCommandOptions): string[
     case "workspace_remove_file": return [...base,"remove",relative,requiredHash(options.input.expected_hash)];
     case "workspace_apply_patch": return [...base,"apply-patch",encodedContent(options.input.content)];
     case "workspace_run_command": { const name=String(options.input.command??""); const command=options.namedCommands[name]; if(!command)throw new Error("Unknown workspace command"); return [...base,"run",...command.map(safeCommandArgument)]; }
-    case "workspace_create_branch": return [...base,"branch",String(options.input.content??"")]; case "workspace_commit": return [...base,"commit",String(options.input.content??"")];
+    case "workspace_create_branch": return [...base,"branch",branchName(options.input.content)]; case "workspace_commit": return [...base,"commit",String(options.input.content??"")];
     case "workspace_stage_deploy": return [...base,"deploy"]; case "workspace_rollback": return [...base,"rollback"];
     default: throw new Error("Unsupported workspace tool");
   }
 }
 
 export function safeRelativePath(value: string, extensions: string[]): string {
-  if (!value || value.startsWith("/") || value.includes("\0") || value.split("/").some((part)=>part===".."||part==="")) throw new Error("Path escapes the workspace");
+  // A segment starting with "-" could be parsed as an option (e.g. --root=/etc) by the helper.
+  if (!value || value.startsWith("/") || value.includes("\0") || value.split("/").some((part)=>part===".."||part===""||part.startsWith("-"))) throw new Error("Path escapes the workspace");
   const ext=path.posix.extname(value).slice(1).toLowerCase(); if(ext&& !extensions.includes(ext)) throw new Error("File type is not allowed");
   if (["wp-config.php",".env","id_rsa","id_ed25519"].includes(path.posix.basename(value))) throw new Error("Protected path");
   return value;
@@ -38,3 +39,4 @@ export function safeRelativePath(value: string, extensions: string[]): string {
 function encodedContent(value:unknown):string{if(typeof value!=="string")throw new Error("Content is required");return Buffer.from(value,"utf8").toString("base64");}
 function requiredHash(value:unknown):string{if(typeof value!=="string"||!/^[a-f0-9]{64}$/i.test(value))throw new Error("Expected SHA-256 hash is required");return value;}
 function safeCommandArgument(value:string):string{if(/[\0\r\n]/.test(value))throw new Error("Invalid named command argument");return value;}
+function branchName(value:unknown):string{if(typeof value!=="string"||!/^[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}$/.test(value)||value.includes(".."))throw new Error("Invalid branch name");return value;}

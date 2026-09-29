@@ -27,6 +27,7 @@
     "@aibroker/plugin-wordpress": "workspace:*",
     "@aibroker/policy": "workspace:*",
     "@aibroker/wordpress-rest": "workspace:*",
+    "@aibroker/page-builders": "workspace:*",
     "@aibroker/wpcli-ssh": "workspace:*",
     "fastify": "^5.2.1",
     "pg": "^8.13.1"

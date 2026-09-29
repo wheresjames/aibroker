@@ -20,7 +20,7 @@ export interface SshExecutionOptions {
 
 export interface SshExecutionResult { exitCode: number; stdout: string; stderr: string; durationMs: number; }
 
-export async function executeElevatedSshScript(options: { credential: ElevatedCredential; script: string }): Promise<SshExecutionResult> {
+export async function executeElevatedSshScript(options: { credential: ElevatedCredential; script: string; timeoutMs?: number }): Promise<SshExecutionResult> {
   validateConnection({
     host: options.credential.host, port: options.credential.port, username: options.credential.username,
     privateKey: options.credential.privateKey, knownHostsLine: options.credential.knownHostsLine, command: ["sh", "-s"]
@@ -32,7 +32,7 @@ export async function executeElevatedSshScript(options: { credential: ElevatedCr
   let agent: { socket: string; pid: string } | null = null;
   try {
     await writeFile(knownHostsPath, `${options.credential.knownHostsLine.trim()}\n`, { mode: 0o600 });
-    const launched = await runProcess("ssh-agent", ["-s"], undefined, {});
+    const launched = await runProcess("ssh-agent", ["-s"], undefined, {}, AGENT_TIMEOUT_MS);
     if (launched.exitCode !== 0) throw new Error(`ssh_agent_failed: ${launched.stderr}`);
     const socket = launched.stdout.match(/SSH_AUTH_SOCK=([^;]+)/)?.[1];
     const pid = launched.stdout.match(/SSH_AGENT_PID=([0-9]+)/)?.[1];
@@ -41,7 +41,7 @@ export async function executeElevatedSshScript(options: { credential: ElevatedCr
     const agentEnv = { SSH_AUTH_SOCK: socket, SSH_AGENT_PID: pid };
     const key = Buffer.from(options.credential.privateKey, "utf8");
     try {
-      const added = await runProcess("ssh-add", ["-"], key, agentEnv);
+      const added = await runProcess("ssh-add", ["-"], key, agentEnv, AGENT_TIMEOUT_MS);
       if (added.exitCode !== 0) throw new Error(`ssh_add_failed: ${added.stderr}`);
     } finally { key.fill(0); }
     const args = [
@@ -50,10 +50,10 @@ export async function executeElevatedSshScript(options: { credential: ElevatedCr
       `${options.credential.username}@${options.credential.host}`,
       options.credential.useSudo ? "sudo -n sh -s" : "sh -s"
     ];
-    const result = await runProcess("ssh", args, Buffer.from(options.script, "utf8"), agentEnv);
+    const result = await runProcess("ssh", args, Buffer.from(options.script, "utf8"), agentEnv, options.timeoutMs ?? 600_000);
     return { ...result, durationMs: Date.now() - started };
   } finally {
-    if (agent) await runProcess("ssh-agent", ["-k"], undefined, { SSH_AUTH_SOCK: agent.socket, SSH_AGENT_PID: agent.pid }).catch(() => undefined);
+    if (agent) await runProcess("ssh-agent", ["-k"], undefined, { SSH_AUTH_SOCK: agent.socket, SSH_AGENT_PID: agent.pid }, AGENT_TIMEOUT_MS).catch(() => undefined);
     await rm(directory, { recursive: true, force: true });
   }
 }
@@ -141,15 +141,18 @@ function runBounded(executable: string, args: string[], timeoutMs: number, maxBy
   });
 }
 
-function runProcess(executable: string, args: string[], input: Buffer | undefined, extraEnv: Record<string, string>): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+const AGENT_TIMEOUT_MS = 30_000;
+
+function runProcess(executable: string, args: string[], input: Buffer | undefined, extraEnv: Record<string, string>, timeoutMs: number): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { shell: false, stdio: [input ? "pipe" : "ignore", "pipe", "pipe"],
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8", ...extraEnv } });
     const stdout: Buffer[] = [], stderr: Buffer[] = [];
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(Object.assign(new Error(`${executable} timed out`), { code: "timeout" })); }, timeoutMs);
     child.stdout!.on("data", (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
     child.stderr!.on("data", (chunk: Buffer) => stderr.push(Buffer.from(chunk)));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ exitCode: code ?? 255, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") }));
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ exitCode: code ?? 255, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") }); });
     if (input) { child.stdin!.end(input); }
   });
 }

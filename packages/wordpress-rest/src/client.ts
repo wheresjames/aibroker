@@ -1,4 +1,4 @@
-import { validateConnectorTarget } from "@aibroker/core";
+import { connectorFetch, validateConnectorTarget } from "@aibroker/core";
 
 export interface WordPressRestCredentials {
   username: string;
@@ -197,7 +197,7 @@ export class WordPressRestClient {
       root = await this.request<WordPressRestRoot>("/wp-json");
     } catch (err) {
       if (err instanceof WordPressRestError && (err.statusCode === 401 || err.statusCode === 403)) {
-        return { reachable: true, authenticated: false, wordpressVersion: null, isMultisite: null, namespaces: [], contentTypes: [], taxonomies: [], mediaSupported: false, design: null, errorCode: "auth_failed", errorMessage: `HTTP ${err.statusCode}` };
+        return { reachable: true, authenticated: false, wordpressVersion: null, isMultisite: null, namespaces: [], contentTypes: [], taxonomies: [], mediaSupported: false, design: null, errorCode: "auth_failed", errorMessage: this.authenticationErrorDetail("/wp-json", err) };
       }
       if (err instanceof WordPressRestError && !["connector_unavailable", "timeout", "invalid_response"].includes(err.wpCode ?? "")) {
         return { reachable: true, authenticated: false, wordpressVersion: null, isMultisite: null, namespaces: [], contentTypes: [], taxonomies: [], mediaSupported: false, design: null, errorCode: "rest_error", errorMessage: err.message };
@@ -217,7 +217,7 @@ export class WordPressRestClient {
       if (err instanceof WordPressRestError && (err.statusCode === 401 || err.statusCode === 403)) {
         return { reachable: true, authenticated: false, wordpressVersion: null, isMultisite: null, namespaces,
           contentTypes: [], taxonomies: [], mediaSupported: false, design: null, errorCode: "auth_failed",
-          errorMessage: "WordPress rejected the username or application password." };
+          errorMessage: this.authenticationErrorDetail("/wp-json/wp/v2/users/me?context=edit", err) };
       }
       return { reachable: true, authenticated: false, wordpressVersion: null, isMultisite: null, namespaces,
         contentTypes: [], taxonomies: [], mediaSupported: false, design: null, errorCode: "auth_probe_failed",
@@ -267,6 +267,24 @@ export class WordPressRestClient {
     return { items: response.body.map(normalizePageSummary), next_cursor: page < totalPages ? String(page + 1) : null };
   }
 
+  private authenticationErrorDetail(path: string, err: WordPressRestError): string {
+    const code = err.wpCode ? ` [${err.wpCode.slice(0, 100)}]` : "";
+    const detail = err.message === `WordPress REST error ${err.statusCode}`
+      ? "The server returned no WordPress error details; a hosting login, proxy, or security plugin may be blocking the REST API."
+      : err.message;
+    let message = `WordPress GET ${path} failed: HTTP ${err.statusCode}${code}. ${detail} Check the WordPress username and application password, account permissions, and whether the host allows authenticated REST requests.`;
+    // A remote JSON error can echo credentials. Never include known secrets in
+    // the diagnostic saved to capabilities/audit or returned to the UI.
+    for (const secret of [
+      basicAuth(this.credentials.username, this.credentials.applicationPassword).slice(6),
+      this.credentials.applicationPassword,
+      this.credentials.applicationPassword.replace(/\s/g, "")
+    ]) {
+      if (secret) message = message.split(secret).join("[redacted]");
+    }
+    return message;
+  }
+
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await this.requestWithHeaders<T>(path, init);
     return response.body;
@@ -279,7 +297,7 @@ export class WordPressRestClient {
   //  - enforces a wall-clock timeout via AbortController;
   //  - caps the response body size;
   //  - normalizes WordPress error codes without ever echoing the Authorization header.
-  private async requestWithHeaders<T>(path: string, init: RequestInit = {}): Promise<{ body: T; headers: Headers }> {
+  private async requestWithHeaders<T>(path: string, init: RequestInit = {}, asText = false): Promise<{ body: T; headers: Headers }> {
     let target = `${this.baseUrl}${path}`;
     const timeoutMs = this.timeoutMs;
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
@@ -288,7 +306,7 @@ export class WordPressRestClient {
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       let response: Response;
       try {
-        response = await fetch(target, {
+        response = await connectorFetch(target, {
           ...init,
           redirect: "manual",
           signal: controller.signal,
@@ -296,37 +314,39 @@ export class WordPressRestClient {
             authorization: basicAuth(this.credentials.username, this.credentials.applicationPassword),
             ...(init.headers ?? {})
           }
-        });
+        }, { allowPrivateTargets: this.allowPrivateTargets });
+
+        // Manual redirect handling so each hop is SSRF-revalidated.
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get("location");
+          if (!location) throw new WordPressRestError(502, "Redirect without a location", "bad_redirect");
+          if (hop === MAX_REDIRECTS) throw new WordPressRestError(502, "Too many redirects", "too_many_redirects");
+          const redirected = new URL(location, target);
+          const previous = new URL(target);
+          if (redirected.hostname !== previous.hostname || (previous.protocol === "https:" && redirected.protocol !== "https:")) {
+            throw new WordPressRestError(502, "Authenticated redirect changed to an unsafe target", "unsafe_redirect");
+          }
+          target = redirected.toString();
+          continue;
+        }
+
+        const bodyText = await readCappedText(response, this.maxResponseBytes);
+        if (!response.ok) throw normalizeWpError(response.status, bodyText);
+        if (asText) return { body: bodyText as T, headers: response.headers };
+        let body: T;
+        try {
+          body = (bodyText ? JSON.parse(bodyText) : {}) as T;
+        } catch {
+          throw new WordPressRestError(502, "WordPress REST endpoint returned invalid JSON. Check its permalink and REST API configuration.", "invalid_response");
+        }
+        return { body, headers: response.headers };
       } catch (err) {
         if (controller.signal.aborted) throw new WordPressRestError(504, "WordPress request timed out", "timeout");
+        if (err instanceof WordPressRestError) throw err;
         throw new WordPressRestError(502, "WordPress connector request failed", "connector_unavailable");
       } finally {
         clearTimeout(timer);
       }
-
-      // Manual redirect handling so each hop is SSRF-revalidated.
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get("location");
-        if (!location) throw new WordPressRestError(502, "Redirect without a location", "bad_redirect");
-        if (hop === MAX_REDIRECTS) throw new WordPressRestError(502, "Too many redirects", "too_many_redirects");
-        const redirected = new URL(location, target);
-        const previous = new URL(target);
-        if (redirected.hostname !== previous.hostname || (previous.protocol === "https:" && redirected.protocol !== "https:")) {
-          throw new WordPressRestError(502, "Authenticated redirect changed to an unsafe target", "unsafe_redirect");
-        }
-        target = redirected.toString();
-        continue;
-      }
-
-      const bodyText = await readCappedText(response, this.maxResponseBytes);
-      if (!response.ok) throw normalizeWpError(response.status, bodyText);
-      let body: T;
-      try {
-        body = (bodyText ? JSON.parse(bodyText) : {}) as T;
-      } catch {
-        throw new WordPressRestError(502, "WordPress REST endpoint returned invalid JSON. Check its permalink and REST API configuration.", "invalid_response");
-      }
-      return { body, headers: response.headers };
     }
     // Unreachable: the loop either returns or throws.
     throw new WordPressRestError(502, "Request did not complete", "connector_unavailable");
@@ -446,27 +466,29 @@ export class WordPressRestClient {
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
       let response: Response;
       try {
-        response = await fetch(target, { redirect: "manual", signal: controller.signal });
+        response = await connectorFetch(target, { redirect: "manual", signal: controller.signal }, { allowPrivateTargets: this.allowPrivateTargets });
+
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get("location");
+          if (!location || hop === MAX_REDIRECTS) throw new WordPressRestError(502, "Too many redirects fetching media", "too_many_redirects");
+          target = new URL(location, target).toString();
+          continue;
+        }
+        if (!response.ok) throw new WordPressRestError(response.status, "Media source returned an error", "media_source_error");
+        const contentType = (response.headers.get("content-type") ?? "application/octet-stream").split(";")[0]!.trim();
+        if (!input.allowedMimeTypes.includes(contentType)) {
+          throw new WordPressRestError(415, `Media type ${contentType} is not allowed`, "media_type_not_allowed");
+        }
+        const text = await readCappedBytes(response, input.maxBytes);
+        const filename = input.filename ?? new URL(target).pathname.split("/").pop() ?? "upload.bin";
+        return this.uploadMedia({ filename, contentType, bytes: text, ...(input.title ? { title: input.title } : {}) });
       } catch (err) {
         if (controller.signal.aborted) throw new WordPressRestError(504, "Media fetch timed out", "timeout");
+        if (err instanceof WordPressRestError) throw err;
         throw new WordPressRestError(502, "Media source fetch failed", "connector_unavailable");
       } finally {
         clearTimeout(timer);
       }
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get("location");
-        if (!location || hop === MAX_REDIRECTS) throw new WordPressRestError(502, "Too many redirects fetching media", "too_many_redirects");
-        target = new URL(location, target).toString();
-        continue;
-      }
-      if (!response.ok) throw new WordPressRestError(response.status, "Media source returned an error", "media_source_error");
-      const contentType = (response.headers.get("content-type") ?? "application/octet-stream").split(";")[0]!.trim();
-      if (!input.allowedMimeTypes.includes(contentType)) {
-        throw new WordPressRestError(415, `Media type ${contentType} is not allowed`, "media_type_not_allowed");
-      }
-      const text = await readCappedBytes(response, input.maxBytes);
-      const filename = input.filename ?? new URL(target).pathname.split("/").pop() ?? "upload.bin";
-      return this.uploadMedia({ filename, contentType, bytes: text, ...(input.title ? { title: input.title } : {}) });
     }
     throw new WordPressRestError(502, "Media fetch did not complete", "connector_unavailable");
   }
@@ -518,6 +540,42 @@ export class WordPressRestClient {
   async listThemeStyleVariations(stylesheet: string): Promise<Record<string, unknown>[]> {
     const body = await this.request<Record<string, unknown>[]>(`/wp-json/wp/v2/global-styles/themes/${encodeStylesheet(stylesheet)}/variations`);
     return Array.isArray(body) ? body : [];
+  }
+
+  // --- Page-builder support (AB-ELEMENTOR) -----------------------------------------
+
+  // Meta keys a collection exposes over REST, read from its OPTIONS schema. Detects
+  // builder data registered for REST (e.g. Elementor ≥3.27's _elementor_data) without
+  // needing a post id.
+  async getRegisteredMetaKeys(restBase: string): Promise<string[]> {
+    const schema = await this.request<{ schema?: { properties?: { meta?: { properties?: Record<string, unknown> } } } }>(
+      `/wp-json/wp/v2/${encodeURIComponent(restBase)}`, { method: "OPTIONS" });
+    return Object.keys(schema.schema?.properties?.meta?.properties ?? {});
+  }
+
+  // WordPress Abilities API (core since 6.9). null when the ability is not registered.
+  async getAbility(name: string): Promise<Record<string, unknown> | null> {
+    try {
+      return await this.request<Record<string, unknown>>(`/wp-json/wp-abilities/v1/abilities/${abilityPath(name)}`);
+    } catch (err) {
+      if (err instanceof WordPressRestError && err.statusCode === 404) return null;
+      throw err;
+    }
+  }
+
+  async runAbility<T = Record<string, unknown>>(name: string, input: Record<string, unknown>): Promise<T> {
+    return this.request<T>(`/wp-json/wp-abilities/v1/abilities/${abilityPath(name)}/run`, jsonBody("POST", { input }));
+  }
+
+  // Site-wide Elementor CSS + element-cache flush; WordPress allows it only for
+  // manage_options, so callers treat a 403 as "not available to this credential".
+  async clearElementorCache(): Promise<void> {
+    await this.request("/wp-json/elementor/v1/cache", { method: "DELETE" });
+  }
+
+  // Public HTML of a front-end path (bounded), e.g. to read <meta name="generator">.
+  async getPublicHtml(path = "/"): Promise<string> {
+    return (await this.requestWithHeaders<string>(path, {}, true)).body;
   }
 
   // Slug → { rest_base } map from /wp/v2/types. Only REST-visible (show_in_rest) types are
@@ -724,6 +782,13 @@ function jsonBody(method: string, body: Record<string, unknown>): RequestInit {
   return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
 }
 
+// Ability names are namespaced ("elementor/update-page-settings"); keep the "/" and
+// encode each segment.
+function abilityPath(name: string): string {
+  if (!/^[a-z0-9-]+\/[a-z0-9-]+$/.test(name)) throw new WordPressRestError(400, "Invalid ability name", "invalid_ability");
+  return name.split("/").map(encodeURIComponent).join("/");
+}
+
 // Encode a stylesheet for a REST path, preserving the single "/" a child theme may use
 // (encodeURIComponent would turn it into %2F and break core's route matching).
 function encodeStylesheet(stylesheet: string): string {
@@ -756,7 +821,8 @@ function buildQuery(query: Record<string, string | number | undefined>): string 
 
 // Read a response body as text with a hard byte cap. Rejects an oversized Content-Length
 // up front, and also guards against a lying/absent header by capping the streamed read.
-async function readCappedText(response: Response, maxBytes: number): Promise<string> {
+// Shared with the session client (session.ts).
+export async function readCappedText(response: Response, maxBytes: number): Promise<string> {
   const declared = Number.parseInt(response.headers.get("content-length") ?? "", 10);
   if (Number.isFinite(declared) && declared > maxBytes) {
     throw new WordPressRestError(502, "WordPress response exceeded the size limit", "response_too_large");

@@ -33,8 +33,38 @@ export async function claimNextJob(db: { query: (sql: string) => Promise<{ rows:
   return result.rows[0] ?? null;
 }
 
-export async function recoverInterruptedJobs(db:{query:(sql:string,params?:unknown[])=>Promise<unknown>}):Promise<void>{
-  await db.query(`update jobs set status='queued',run_after=now(),updated_at=now(),last_error='worker_restarted' where status='running' and updated_at<now()-interval '5 minutes' and kind<>'host.session'`);
-  await db.query(`update host_operations set status='queued',started_at=null,updated_at=now(),error_code=null where status='running' and updated_at<now()-interval '5 minutes' and cancel_requested_at is null`);
-  await db.query(`update host_sessions set status='disconnected',ended_at=now() where status in ('starting','active') and last_activity_at<now()-interval '5 minutes'`);
+type JobDb = { query: (sql: string, params?: unknown[]) => Promise<unknown> };
+
+export async function recoverInterruptedJobs(db: JobDb): Promise<void> {
+  // Recover the job and its operation atomically: another worker must not claim
+  // the job while the operation still says running.
+  await db.query(`with recovered as (
+    update jobs set status='queued',run_after=now(),updated_at=now(),last_error='worker_restarted'
+    where status='running' and updated_at<now()-interval '5 minutes' and kind<>'host.session'
+    returning id
+  )
+  update host_operations set status='queued',started_at=null,updated_at=now(),error_code=null
+  where status='running' and cancel_requested_at is null and job_id in (select id from recovered)`);
+}
+
+export function startJobHeartbeat(db: JobDb, jobId: string, onError: (error: unknown) => void): () => Promise<void> {
+  let pending: Promise<unknown> | undefined;
+  const timer = setInterval(() => {
+    if (pending) return;
+    pending = db.query("update jobs set updated_at=now() where id=$1 and status='running'", [jobId])
+      .catch(onError).finally(() => { pending = undefined; });
+  }, 30_000);
+  timer.unref();
+  return async () => { clearInterval(timer); await pending; };
+}
+
+// Called from the claim loop, including when there are no queued jobs. A job
+// skipped immediately after restart will therefore be reconsidered when stale.
+export function createJobRecovery(db: JobDb): () => Promise<void> {
+  let nextRecovery = 0;
+  return async () => {
+    if (Date.now() < nextRecovery) return;
+    await recoverInterruptedJobs(db);
+    nextRecovery = Date.now() + 30_000;
+  };
 }

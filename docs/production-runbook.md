@@ -13,7 +13,8 @@
 2. Create or update `aibroker-secrets`.
 3. Run the migration job.
 4. Roll out API, worker, and web deployments.
-5. Verify `/health/ready` and `/metrics`.
+5. Verify `/health/ready` and `/metrics` (production serves `/metrics` only when
+   `AIBROKER_METRICS_TOKEN` is set; scrape it with `Authorization: Bearer <token>`).
 6. Confirm policy, group, and server-binding administration works in the web UI before enabling MCP traffic.
 
 ## Rollback

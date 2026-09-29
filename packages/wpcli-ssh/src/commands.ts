@@ -34,7 +34,7 @@ export function buildWpCliCommand(spec: WpCliCommandSpec): string[] {
   const fixed = simple[spec.tool];
   if (fixed) return [...args, ...fixed];
   const input = spec.input ?? {};
-  const name = () => identifier(input.name, "name");
+  const name = () => slug(input.name, "name");
   switch (spec.tool) {
     case "wordpress.install_plugin": return [...args, "plugin", "install", name(), ...(input.activate === true ? ["--activate"] : [])];
     case "wordpress.activate_plugin": return [...args, "plugin", "activate", name()];
@@ -60,7 +60,7 @@ export function parseWpCliJson<T = unknown>(output: string): T {
 }
 
 export function buildNetworkCommand(tool:NetworkTool,wpCliPath:string,wordpressPath:string|null,input:Record<string,unknown>):string[]{
-  const prefix=buildPrefix(wpCliPath,wordpressPath);const blog=()=>integer(input.blog_id,"blog_id");const user=()=>identifier(input.user,"user");const plugin=()=>identifier(input.name,"name");
+  const prefix=buildPrefix(wpCliPath,wordpressPath);const blog=()=>integer(input.blog_id,"blog_id");const user=()=>identifier(input.user,"user");const plugin=()=>slug(input.name,"name");
   switch(tool){
     case"network_list_sites":return[...prefix,"server","list","--format=json"];
     case"network_create_site":return[...prefix,"server","create",`--slug=${identifier(input.slug,"slug")}`,`--title=${text(input.title,"title")}`,`--email=${text(input.email,"email")}`,"--porcelain"];
@@ -69,7 +69,7 @@ export function buildNetworkCommand(tool:NetworkTool,wpCliPath:string,wordpressP
     case"network_list_super_admins":return[...prefix,"super-admin","list"];case"network_grant_super_admin":return[...prefix,"super-admin","add",user()];case"network_revoke_super_admin":return[...prefix,"super-admin","remove",user()];
     case"network_activate_plugin":return[...prefix,"plugin","activate",plugin(),"--network"];case"network_deactivate_plugin":return[...prefix,"plugin","deactivate",plugin(),"--network"];case"network_update_plugin":return[...prefix,"plugin","update",plugin()];case"network_enable_theme":return[...prefix,"theme","enable",plugin(),"--network"];
     case"network_assign_user":return[...prefix,"user","add-role",user(),identifier(input.role,"role"),`--url=${text(input.site_url,"site_url")}`];case"network_update_core_database":return[...prefix,"core","update-db","--network"];
-    case"network_migrate_domain":return[...prefix,"search-replace",text(input.old_url,"old_url"),text(input.new_url,"new_url"),"--network","--all-tables-with-prefix","--precise","--report-changed-only"];
+    case"network_migrate_domain":return[...prefix,"search-replace",positional(input.old_url,"old_url"),positional(input.new_url,"new_url"),"--network","--all-tables-with-prefix","--precise","--report-changed-only"];
   }
 }
 
@@ -77,8 +77,19 @@ function buildPrefix(executable:string,wordpressPath:string|null):string[]{if(!i
 function integer(value:unknown,field:string):string{if(!Number.isInteger(value)||Number(value)<1)throw new Error(`Invalid ${field}`);return String(value);}
 function text(value:unknown,field:string):string{if(typeof value!=="string"||value.length<1||value.length>500||/[\0\r\n]/.test(value))throw new Error(`Invalid ${field}`);return value;}
 
+// Positional arguments must never start with "-", or WP-CLI parses them as flags
+// (e.g. a plugin "name" of --all turns a single-plugin delete into delete-everything).
+function positional(value:unknown,field:string):string{const checked=text(value,field);if(checked.startsWith("-"))throw new Error(`Invalid ${field}`);return checked;}
+
 function identifier(value: unknown, field: string): string {
-  if (typeof value !== "string" || !/^[A-Za-z0-9_.@/+:-]{1,200}$/.test(value)) throw new Error(`Invalid ${field}`);
+  if (typeof value !== "string" || !/^[A-Za-z0-9_.@+:][A-Za-z0-9_.@/+:-]{0,199}$/.test(value)) throw new Error(`Invalid ${field}`);
+  return value;
+}
+
+// Plugin/theme slugs only: no URLs or filesystem paths, which `wp plugin install`
+// would otherwise fetch or unpack as arbitrary code.
+function slug(value: unknown, field: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}$/.test(value)) throw new Error(`Invalid ${field}`);
   return value;
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { pluginConformanceProblems } from "@aibroker/plugin-sdk";
-import { normalizePlaywrightConfig, playwrightPlugin, PLAYWRIGHT_TOOL_DEFINITIONS } from "./index.js";
+import { assertAuthenticatedBrowserScope, normalizePlaywrightConfig, playwrightPlugin, PLAYWRIGHT_TOOL_DEFINITIONS } from "./index.js";
 
 const server = { id: "1", name: "Site", address: "example.com", metadata: {} };
 describe("playwright plugin", () => {
@@ -8,6 +8,12 @@ describe("playwright plugin", () => {
   it("normalizes exact origins and typed limits", () => expect(normalizePlaywrightConfig({ allowed_origins: "https://example.com" }, server)).toMatchObject({
     base_url: "https://example.com/", allowed_origins: ["https://example.com"], viewport_width: 1440
   }));
+  it("requires narrow path prefixes for authenticated browser state", () => {
+    expect(() => assertAuthenticatedBrowserScope({})).toThrow(/allowed_path_prefixes/);
+    expect(() => assertAuthenticatedBrowserScope({ allowed_path_prefixes: [] })).toThrow(/allowed_path_prefixes/);
+    expect(() => assertAuthenticatedBrowserScope({ allowed_path_prefixes: ["/app", "/"] })).toThrow(/allowed_path_prefixes/);
+    expect(() => assertAuthenticatedBrowserScope({ allowed_path_prefixes: ["/app"] })).not.toThrow();
+  });
   it("rejects wildcard/path origins", () => expect(() => normalizePlaywrightConfig({ allowed_origins: "https://example.com/path" }, server)).toThrow(/exact/));
   it("dispatches through the browser executor", async () => {
     const execute = vi.fn(async () => ({ kind: "broker_tool_result" as const, structuredContent: {} }));

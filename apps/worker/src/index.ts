@@ -3,7 +3,7 @@ import { loadConfig, redactObject, redactValue } from "@aibroker/core";
 import { decryptJson, loadEncryptionKey, type EncryptedPayload } from "@aibroker/crypto";
 import { WordPressRestClient } from "@aibroker/wordpress-rest";
 import { recordServerPluginCapabilities } from "@aibroker/db";
-import { claimNextJob, recoverInterruptedJobs, validateJobPayload, type DurableJob } from "./jobs.js";
+import { claimNextJob, createJobRecovery, startJobHeartbeat, validateJobPayload, type DurableJob } from "./jobs.js";
 import { buildNetworkCommand, buildRecoveryCommand, buildWorkspaceCommand, buildWpCliCommand, executeSshCommand, parseWpCliJson, runSshSession, type NetworkTool, type RecoveryTool, type WpCliTool } from "@aibroker/wpcli-ssh";
 import { executeReviewedProvider } from "./provider-adapters.js";
 
@@ -241,19 +241,23 @@ function parsePossibleJson(output: string): unknown {
 async function tick(): Promise<void> {
   const job = await claimNextJob(pool);
   if (!job) return;
+  const stopHeartbeat = startJobHeartbeat(pool, job.id, (error) => console.error("Job heartbeat failed", error));
   try {
     await processJob(job);
     await pool.query("update jobs set status = 'succeeded', updated_at = now(), last_error = null where id = $1", [job.id]);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await pool.query("update jobs set status = 'failed', updated_at = now(), last_error = $2 where id = $1", [job.id, message.slice(0, 1000)]);
-  }
+  } finally { await stopHeartbeat(); }
 }
 
 async function run(): Promise<void> {
-  await recoverInterruptedJobs(pool);
+  const recover = createJobRecovery(pool);
+  await recover();
+  await pool.query("update host_sessions set status='disconnected',ended_at=now() where status in ('starting','active') and last_activity_at<now()-interval '5 minutes'");
   console.log(JSON.stringify({ level: "info", message: "AIBroker database worker listening" }));
   while (!stopping) {
+    await recover();
     await tick();
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }

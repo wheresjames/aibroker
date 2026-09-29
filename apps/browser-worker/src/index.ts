@@ -26,7 +26,24 @@ interface LiveSession {
   idleExpiresAt: number; absoluteExpiresAt: number; busy: boolean;
 }
 
+// A live login capture (AB-ELEMENTOR D7): a browser the user drives through the
+// AIBroker UI (frames out, clicks/keys in) until the login cookie appears. Its storage
+// state is handed back once and the context is destroyed.
+interface Capture {
+  id: string; context: BrowserContext; page: Page; policy: DestinationPolicy;
+  successCookiePrefix: string | null; completed: boolean;
+  idleExpiresAt: number; absoluteExpiresAt: number; busy: boolean;
+  viewport: { width: number; height: number };
+}
+
 let browser: Browser | null = null;
+let captureBrowser: Browser | null = null;
+const captures = new Map<string, Capture>();
+// Headed under Xvfb in the container image (fewer bot-detection false positives);
+// headless elsewhere so development machines need no display.
+const captureHeadless = process.env.AIBROKER_BROWSER_CAPTURE_HEADLESS !== "false";
+const CAPTURE_IDLE_MS = 2 * 60_000, CAPTURE_MAX_MS = 5 * 60_000;
+const CAPTURE_KEYS = new Set(["Enter", "Tab", "Backspace", "Delete", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Space"]);
 const metrics = { launches: 0, crashes: 0, timeouts: 0, active: 0, operations: 0, failures: 0, blocked: 0, durationMs: 0 };
 const replayWindow = new Map<string, number>();
 const sessions = new Map<string, LiveSession>();
@@ -45,6 +62,12 @@ async function getBrowser(): Promise<Browser> {
     browser.on("disconnected", () => { metrics.crashes++; });
   }
   return browser;
+}
+
+async function getCaptureBrowser(): Promise<Browser> {
+  if (captureHeadless) return getBrowser();
+  if (!captureBrowser?.isConnected()) captureBrowser = await chromium.launch({ headless: false, args: ["--window-position=0,0"] });
+  return captureBrowser;
 }
 
 function authenticate(timestamp: string | undefined, nonce: string | undefined, signature: string | undefined, body: unknown): boolean {
@@ -273,6 +296,99 @@ async function execute(input: BrowserRequest): Promise<Record<string, unknown>> 
   } finally { metrics.active--; metrics.durationMs += Date.now() - started; await context?.close().catch(() => undefined); }
 }
 
+interface CaptureStart {
+  capture_id: string; url: string; allowed_origins: string[]; allow_private: boolean; private_hostname?: string;
+  viewport: { width: number; height: number }; locale: string; timezone: string; color_scheme: "light" | "dark" | "no-preference";
+  success_cookie_prefix?: string;
+}
+type CaptureEvent =
+  | { type: "click"; x: number; y: number }
+  | { type: "text"; text: string }
+  | { type: "key"; key: string }
+  | { type: "scroll"; dy: number };
+
+async function closeCapture(capture: Capture): Promise<void> {
+  captures.delete(capture.id);
+  await capture.context.close().catch(() => undefined);
+}
+
+function claimCapture(id: string): Capture {
+  const capture = captures.get(id);
+  if (!capture) throw new Error("browser_capture_not_found");
+  const now = Date.now();
+  if (now >= capture.idleExpiresAt || now >= capture.absoluteExpiresAt) { void closeCapture(capture); throw new Error("browser_capture_expired"); }
+  if (capture.busy) throw new Error("browser_session_busy");
+  capture.busy = true;
+  capture.idleExpiresAt = Math.min(now + CAPTURE_IDLE_MS, capture.absoluteExpiresAt);
+  return capture;
+}
+
+async function checkCaptureComplete(capture: Capture): Promise<void> {
+  if (capture.completed || !capture.successCookiePrefix) return;
+  const cookies = await capture.context.cookies();
+  if (cookies.some((cookie) => cookie.name.startsWith(capture.successCookiePrefix!))) capture.completed = true;
+}
+
+async function captureFrame(capture: Capture): Promise<Record<string, unknown>> {
+  await checkCaptureComplete(capture);
+  const image = await capture.page.screenshot({ type: "jpeg", quality: 60, timeout: timeoutMs });
+  return {
+    status: capture.completed ? "completed" : "active", url: bounded(capture.page.url(), 2048), title: bounded(await capture.page.title().catch(() => ""), 500),
+    width: capture.viewport.width, height: capture.viewport.height, image_base64: image.toString("base64"),
+    expires_at: capture.absoluteExpiresAt
+  };
+}
+
+async function startCapture(input: CaptureStart): Promise<Record<string, unknown>> {
+  if (captures.has(input.capture_id)) throw new Error("browser_session_conflict");
+  if (sessions.size + captures.size >= maxSessions) throw new Error("browser_session_limit");
+  // Login flows move across the whole site (login page, 2FA step, wp-admin), so no
+  // path restriction; the origin allowlist still confines every request.
+  const policy: DestinationPolicy = { allowedOrigins: input.allowed_origins, allowedPathPrefixes: [], allowPrivate: input.allow_private,
+    ...(input.private_hostname ? { privateHostname: input.private_hostname } : {}), pinnedAddresses: new Map() };
+  await validateDestination(input.url, policy);
+  const context = await (await getCaptureBrowser()).newContext({
+    viewport: input.viewport, locale: input.locale, timezoneId: input.timezone, colorScheme: input.color_scheme,
+    serviceWorkers: "block", acceptDownloads: false, permissions: []
+  });
+  await applyNetworkPolicy(context, policy);
+  const page = await context.newPage();
+  page.on("popup", (popup) => void popup.close());
+  const now = Date.now();
+  const capture: Capture = { id: input.capture_id, context, page, policy, successCookiePrefix: input.success_cookie_prefix ?? null, completed: false,
+    idleExpiresAt: now + CAPTURE_IDLE_MS, absoluteExpiresAt: now + CAPTURE_MAX_MS, busy: true, viewport: input.viewport };
+  captures.set(capture.id, capture);
+  try {
+    // Wait for load (plus a beat) so the page's own autofocus, e.g. wp-login's username
+    // field, has run before the user's first keystrokes arrive.
+    await page.goto(input.url, { waitUntil: "load", timeout: timeoutMs });
+    await page.waitForTimeout(300);
+    return await captureFrame(capture);
+  } catch (error) { await closeCapture(capture); throw error; }
+  finally { capture.busy = false; }
+}
+
+async function applyCaptureEvents(capture: Capture, events: CaptureEvent[]): Promise<void> {
+  if (capture.completed) return;
+  for (const event of events) {
+    const bad = (event.type === "click" && (typeof event.x !== "number" || typeof event.y !== "number")) || (event.type === "text" && typeof event.text !== "string")
+      || (event.type === "key" && typeof event.key !== "string") || (event.type === "scroll" && typeof event.dy !== "number");
+    if (bad) throw new Error("browser_invalid_request");
+    if (event.type === "click") {
+      if (event.x < 0 || event.y < 0 || event.x > capture.viewport.width || event.y > capture.viewport.height) throw new Error("browser_invalid_request");
+      await capture.page.mouse.click(event.x, event.y);
+    } else if (event.type === "text") {
+      await capture.page.keyboard.type(event.text);
+    } else if (event.type === "key") {
+      if (!CAPTURE_KEYS.has(event.key)) throw new Error("browser_invalid_request");
+      await capture.page.keyboard.press(event.key === "Space" ? " " : event.key);
+    } else if (event.type === "scroll") {
+      await capture.page.mouse.wheel(0, Math.max(-2000, Math.min(2000, event.dy)));
+    }
+  }
+  await capture.page.waitForTimeout(250);
+}
+
 const app = Fastify({ bodyLimit: 256 * 1024, logger: true });
 const executionBodySchema = {
   type: "object",
@@ -320,6 +436,7 @@ app.get("/metrics", async (_request, reply) => reply.type("text/plain; version=0
   `aibroker_browser_timeouts_total ${metrics.timeouts}`,
   `aibroker_browser_active_contexts ${metrics.active + sessions.size}`,
   `aibroker_browser_live_sessions ${sessions.size}`,
+  `aibroker_browser_login_captures ${captures.size}`,
   `aibroker_browser_max_sessions ${maxSessions}`,
   `aibroker_browser_requests_in_flight ${inFlight}`,
   `aibroker_browser_max_concurrent ${maxConcurrent}`,
@@ -363,12 +480,90 @@ app.post<{ Body: { worker_lease_id: string } }>("/v1/sessions/close", { schema: 
   return { status: "closed" };
 });
 
+const captureIdSchema = { type: "string", format: "uuid" } as const;
+function captureError(reply: { code: (status: number) => { send: (body: unknown) => unknown } }, error: unknown) {
+  const candidate = error instanceof Error ? error.message : "";
+  const allowed = new Set(["browser_destination_denied", "browser_capture_not_found", "browser_capture_expired", "browser_session_busy", "browser_session_conflict", "browser_session_limit", "browser_invalid_request"]);
+  const code = allowed.has(candidate) ? candidate : candidate.includes("Timeout") ? "browser_timeout" : "browser_navigation_failed";
+  const status = code === "browser_destination_denied" ? 403 : code === "browser_capture_not_found" ? 404 : code === "browser_capture_expired" ? 410
+    : code === "browser_session_limit" ? 429 : code === "browser_invalid_request" ? 400 : code === "browser_timeout" ? 504 : code === "browser_navigation_failed" ? 502 : 409;
+  return reply.code(status).send({ error: code });
+}
+const signed = (request: { headers: Record<string, unknown>; body: unknown }) => authenticate(request.headers["x-aib-timestamp"] as string | undefined,
+  request.headers["x-aib-nonce"] as string | undefined, request.headers["x-aib-signature"] as string | undefined, request.body);
+
+app.post<{ Body: CaptureStart }>("/v1/capture/start", { schema: { body: { type: "object", additionalProperties: false,
+  required: ["capture_id", "url", "allowed_origins", "allow_private", "viewport", "locale", "timezone", "color_scheme"],
+  properties: {
+    capture_id: captureIdSchema, url: executionBodySchema.properties.url, allowed_origins: executionBodySchema.properties.allowed_origins,
+    allow_private: { type: "boolean" }, private_hostname: executionBodySchema.properties.private_hostname,
+    viewport: executionBodySchema.properties.viewport, locale: executionBodySchema.properties.locale, timezone: executionBodySchema.properties.timezone,
+    color_scheme: executionBodySchema.properties.color_scheme, success_cookie_prefix: { type: "string", pattern: "^[A-Za-z0-9_-]{1,100}$" }
+  } } } }, async (request, reply) => {
+  if (!signed(request)) return reply.code(401).send({ error: "unauthorized" });
+  try { return await startCapture(request.body); } catch (error) { return captureError(reply, error); }
+});
+
+app.post<{ Body: { capture_id: string } }>("/v1/capture/frame", { schema: { body: { type: "object", additionalProperties: false,
+  required: ["capture_id"], properties: { capture_id: captureIdSchema } } } }, async (request, reply) => {
+  if (!signed(request)) return reply.code(401).send({ error: "unauthorized" });
+  let capture: Capture | undefined;
+  try { capture = claimCapture(request.body.capture_id); return await captureFrame(capture); }
+  catch (error) { return captureError(reply, error); }
+  finally { if (capture) capture.busy = false; }
+});
+
+app.post<{ Body: { capture_id: string; events: CaptureEvent[] } }>("/v1/capture/input", { schema: { body: { type: "object", additionalProperties: false,
+  // One flat event schema: Fastify's Ajv runs with removeAdditional, which would strip
+  // fields while trying oneOf branches. Per-type checks happen in applyCaptureEvents.
+  required: ["capture_id", "events"], properties: { capture_id: captureIdSchema, events: { type: "array", minItems: 1, maxItems: 50, items: {
+    type: "object", additionalProperties: false, required: ["type"], properties: {
+      type: { type: "string", enum: ["click", "text", "key", "scroll"] }, x: { type: "number" }, y: { type: "number" },
+      text: { type: "string", minLength: 1, maxLength: 1000 }, key: { type: "string", maxLength: 20 }, dy: { type: "number" }
+    } } } } } } }, async (request, reply) => {
+  if (!signed(request)) return reply.code(401).send({ error: "unauthorized" });
+  let capture: Capture | undefined;
+  try { capture = claimCapture(request.body.capture_id); await applyCaptureEvents(capture, request.body.events); return await captureFrame(capture); }
+  catch (error) { return captureError(reply, error); }
+  finally { if (capture) capture.busy = false; }
+});
+
+// Hands the storage state back exactly once, then destroys the context. Without a
+// success cookie (generic captures) the caller finishes explicitly with force.
+app.post<{ Body: { capture_id: string; force?: boolean } }>("/v1/capture/finish", { schema: { body: { type: "object", additionalProperties: false,
+  required: ["capture_id"], properties: { capture_id: captureIdSchema, force: { type: "boolean" } } } } }, async (request, reply) => {
+  if (!signed(request)) return reply.code(401).send({ error: "unauthorized" });
+  let capture: Capture | undefined;
+  try {
+    capture = claimCapture(request.body.capture_id);
+    await checkCaptureComplete(capture);
+    if (!capture.completed && request.body.force !== true) return { status: "active" };
+    const storageState = await capture.context.storageState();
+    await closeCapture(capture);
+    return { status: "completed", storage_state: storageState };
+  } catch (error) { return captureError(reply, error); }
+  finally { if (capture) capture.busy = false; }
+});
+
+app.post<{ Body: { capture_id: string } }>("/v1/capture/cancel", { schema: { body: { type: "object", additionalProperties: false,
+  required: ["capture_id"], properties: { capture_id: captureIdSchema } } } }, async (request, reply) => {
+  if (!signed(request)) return reply.code(401).send({ error: "unauthorized" });
+  const capture = captures.get(request.body.capture_id);
+  if (capture) await closeCapture(capture);
+  return { status: "cancelled" };
+});
+
 const sessionExpiry = setInterval(() => {
   const now = Date.now();
   for (const session of sessions.values()) if (now >= session.idleExpiresAt || now >= session.absoluteExpiresAt) void closeLiveSession(session);
+  for (const capture of captures.values()) if (!capture.busy && (now >= capture.idleExpiresAt || now >= capture.absoluteExpiresAt)) void closeCapture(capture);
 }, 5000);
 sessionExpiry.unref();
 
-const shutdown = async () => { clearInterval(sessionExpiry); await Promise.all([...sessions.values()].map(closeLiveSession)); await app.close(); await browser?.close(); process.exit(0); };
+const shutdown = async () => {
+  clearInterval(sessionExpiry);
+  await Promise.all([...sessions.values()].map(closeLiveSession)); await Promise.all([...captures.values()].map(closeCapture));
+  await app.close(); await browser?.close(); await captureBrowser?.close(); process.exit(0);
+};
 process.on("SIGTERM", () => void shutdown()); process.on("SIGINT", () => void shutdown());
 await app.listen({ host: "0.0.0.0", port });

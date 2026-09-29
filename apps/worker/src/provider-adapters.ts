@@ -1,4 +1,4 @@
-import { validateConnectorTarget } from "@aibroker/core";
+import { connectorFetch, validateConnectorTarget } from "@aibroker/core";
 
 export interface ProviderRequest { tool:string;baseUrl:string;token:string;input:Record<string,unknown>;idempotencyKey?:string;allowPrivateTargets:boolean; }
 export interface ProviderResult { providerReference?:string;status:string;result:unknown; }
@@ -9,7 +9,7 @@ const mappings:Record<string,Mapping>={hosting_deploy:{method:"POST",path:"/depl
 export async function executeReviewedProvider(request:ProviderRequest):Promise<ProviderResult>{
   const mapping=mappings[request.tool];if(!mapping)throw new Error("Provider tool is not reviewed");
   const url=new URL(mapping.path,request.baseUrl);if(mapping.method==="GET")for(const[key,value]of Object.entries(request.input)){if(["server_id","reason","idempotency_key"].includes(key)||value==null)continue;if(typeof value==="string"||typeof value==="number"||typeof value==="boolean")url.searchParams.set(key,String(value));}const target=url.toString();await validateConnectorTarget(target,{allowPrivateTargets:request.allowPrivateTargets});
-  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),120000);let response:Response;let text:string;try{response=await fetch(target,{method:mapping.method,redirect:"error",signal:controller.signal,headers:{authorization:`Bearer ${request.token}`,"content-type":"application/json",...(request.idempotencyKey?{"idempotency-key":request.idempotencyKey}:{})},...(mapping.method==="POST"?{body:JSON.stringify(request.input)}:{})});text=await readBounded(response,1024*1024);}finally{clearTimeout(timer);}let result:unknown;try{result=text?JSON.parse(text):{};}catch{result={message:text};}
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),120000);let response:Response;let text:string;try{response=await connectorFetch(target,{method:mapping.method,redirect:"error",signal:controller.signal,headers:{authorization:`Bearer ${request.token}`,"content-type":"application/json",...(request.idempotencyKey?{"idempotency-key":request.idempotencyKey}:{})},...(mapping.method==="POST"?{body:JSON.stringify(request.input)}:{})},{allowPrivateTargets:request.allowPrivateTargets});text=await readBounded(response,1024*1024);}finally{clearTimeout(timer);}let result:unknown;try{result=text?JSON.parse(text):{};}catch{result={message:text};}
   if(!response.ok)throw Object.assign(new Error(`Provider returned HTTP ${response.status}`),{code:"provider_error",status:response.status});
   const body=result as{ id?:unknown;status?:unknown};return{...(body&&typeof body.id==="string"?{providerReference:body.id}:{}),status:body&&typeof body.status==="string"?body.status:"succeeded",result};
 }

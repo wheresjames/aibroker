@@ -25,6 +25,7 @@ export interface AIBrokerConfig {
   artifactS3SecretAccessKey?: string;
   artifactDefaultRetentionSeconds: number;
   artifactMaxRetentionSeconds: number;
+  metricsToken?: string;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -51,8 +52,33 @@ function boolFromEnv(env: NodeJS.ProcessEnv, key: string, fallback = false): boo
   return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
 }
 
+// Placeholder values shipped in docker-compose.yml, .env.example and the k8s example secret.
+const PLACEHOLDER_SECRET_PATTERN = /change_me|replace[-_]with/i;
+
+function assertProductionSecrets(config: AIBrokerConfig): void {
+  const secrets: Array<[string, string]> = [
+    ["AIBROKER_SESSION_SECRET", config.sessionSecret],
+    ["AIBROKER_BROWSER_WORKER_SECRET", config.browserWorkerSecret]
+  ];
+  for (const [key, value] of secrets) {
+    if (value.length < 32 || PLACEHOLDER_SECRET_PATTERN.test(value)) {
+      throw new Error(`${key} must be a unique random value of at least 32 characters in production`);
+    }
+  }
+  const key = Buffer.from(config.encryptionKeyBase64, "base64");
+  if (PLACEHOLDER_SECRET_PATTERN.test(config.encryptionKeyBase64) || key.byteLength !== 32 || key.every((byte) => byte === key[0])) {
+    throw new Error("AIBROKER_ENCRYPTION_KEY_BASE64 must be a random 32-byte key in production");
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AIBrokerConfig {
   const nodeEnv = env.NODE_ENV ?? "development";
+  const config = buildConfig(env, nodeEnv);
+  if (nodeEnv === "production") assertProductionSecrets(config);
+  return config;
+}
+
+function buildConfig(env: NodeJS.ProcessEnv, nodeEnv: string): AIBrokerConfig {
   const artifactBackend = env.AIBROKER_ARTIFACT_BACKEND === "s3" ? "s3" : "filesystem";
   return {
     nodeEnv,
@@ -81,5 +107,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AIBrokerConfig
     ...(env.AIBROKER_ARTIFACT_S3_SECRET_ACCESS_KEY ? { artifactS3SecretAccessKey: env.AIBROKER_ARTIFACT_S3_SECRET_ACCESS_KEY } : {}),
     artifactDefaultRetentionSeconds: intFromEnv(env, "AIBROKER_ARTIFACT_DEFAULT_RETENTION_SECONDS", 86_400),
     artifactMaxRetentionSeconds: intFromEnv(env, "AIBROKER_ARTIFACT_MAX_RETENTION_SECONDS", 604_800),
+    ...(env.AIBROKER_METRICS_TOKEN ? { metricsToken: env.AIBROKER_METRICS_TOKEN } : {}),
   };
 }

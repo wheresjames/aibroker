@@ -1,19 +1,10 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { isPrivateOrLocalAddress } from "@aibroker/core";
 
-function privateV4(address: string): boolean {
-  const octets = address.split(".").map(Number);
-  const [a = -1, b = -1] = octets;
-  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
-}
-
+// Shares the broker's connector blocklist so the two SSRF guards cannot drift apart.
 export function isPrivateAddress(address: string): boolean {
-  if (isIP(address) === 4) return privateV4(address);
-  if (isIP(address) !== 6) return true;
-  const value = address.toLowerCase();
-  return value === "::" || value === "::1" || value.startsWith("fe80:") || value.startsWith("fc") || value.startsWith("fd")
-    || value.startsWith("ff") || (value.startsWith("::ffff:") && privateV4(value.slice(7)));
+  return isPrivateOrLocalAddress(address);
 }
 
 export interface DestinationPolicy {
@@ -28,7 +19,7 @@ function alwaysBlocked(address: string): boolean {
   }
   const value = address.toLowerCase();
   if (value.startsWith("::ffff:")) return alwaysBlocked(value.slice(7));
-  return value === "::" || value.startsWith("fe80:") || value.startsWith("ff");
+  return value === "::" || /^fe[89ab]/.test(value) || value.startsWith("ff");
 }
 
 export async function validateDestination(raw: string, policy: DestinationPolicy): Promise<URL> {

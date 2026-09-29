@@ -19,6 +19,7 @@ policy, or unbind a server and every affected client's behavior changes in one p
 - [What AIBroker does](#what-aibroker-does)
 - [How it fits together](#how-it-fits-together)
 - [Quick start](#quick-start)
+- [Connect your existing WordPress site](#connect-your-existing-wordpress-site)
 - [The access model in one minute](#the-access-model-in-one-minute)
 - [Roles](#roles)
 - [The admin UI](#the-admin-ui)
@@ -152,6 +153,161 @@ password; subsequent starts do not echo the credentials.
 > Tip: To try the full end-to-end flow against a *real* throwaway WordPress server, start
 > the stack with a test server instead: `./dev.sh run --wptest server1`. See
 > [Throwaway WordPress test servers](#throwaway-wordpress-test-servers).
+
+---
+
+## Connect your existing WordPress site
+
+This walkthrough starts with your website address and WordPress login. It connects
+an existing site through WordPress's REST API (the interface applications use to
+read and change site content). You can do this in a browser; this connection does
+not require SSH, a hosting control panel, or installing an AIBroker plugin inside
+WordPress. Server maintenance features that require SSH need separate setup by
+someone with hosting access.
+
+### 1. Get access to AIBroker
+
+1. Ask the person running AIBroker for its web address and an AIBroker account.
+   Your WordPress login and your AIBroker login are separate accounts.
+2. Open that address, sign in, and change your initial password if prompted.
+3. Look for **Servers** and **Groups** in the sidebar. Registering a site and
+   granting access requires an AIBroker administrator. If those pages are missing,
+   ask that administrator to carry out steps 4–6 with you. You can still prepare
+   the WordPress details in steps 2–3 yourself.
+
+If nobody has installed AIBroker yet, ask the person who will operate it to follow
+[Quick start](#quick-start) first and give you the resulting web address. The
+`localhost` addresses there work on the machine running the stack; they are not
+the address of your existing WordPress site.
+
+### 2. Sign in to WordPress and find your site details
+
+1. Open your usual WordPress login page. For a site at `https://example.com`, this
+   is normally `https://example.com/wp-admin/`. Replace `example.com` with your
+   own domain. Use your usual custom login address if your site has one.
+2. Sign in with your existing WordPress credentials and complete any two-factor
+   authentication prompt.
+3. Open **Users → Profile**, or **Profile** if that is the menu shown for your
+   account. Note the **Username** displayed there, especially if you normally
+   sign in with an email address. You will enter this username in AIBroker.
+4. Note the site's HTTPS base address, such as `https://example.com`. Preserve
+   a site subdirectory if applicable, such as `https://example.com/blog`.
+   Leave off `/wp-admin/`, `/wp-login.php`, and `/wp-json/`.
+5. To check the API address, open that base address followed by `/wp-json/` in
+   a new browser tab, for example `https://example.com/wp-json/`. A page of
+   structured text containing keys such as `name` and `namespaces` is expected.
+   This checks availability, not your credentials. If you get an error or a
+   normal webpage, ask your WordPress administrator or host to confirm the REST
+   API base address before continuing.
+
+### 3. Create a WordPress application password
+
+1. Return to your WordPress **Profile** and find **Application Passwords**.
+2. Enter `AIBroker` as the application name and click **Add New Application Password**.
+3. Copy the generated password immediately into a password manager; WordPress
+   shows it only once. This is the password to enter in AIBroker. Keep using your
+   usual password for WordPress browser logins.
+   AIBroker accepts it **with or without spaces**: you can paste it exactly as
+   WordPress displays it. AIBroker passes it through unchanged, and WordPress
+   removes the spaces when validating it.
+
+If the section is missing, ask your WordPress administrator or hosting support:
+“Please enable WordPress Application Passwords for my account, confirm HTTPS is
+working, and confirm authenticated REST API access is allowed.” This feature
+requires WordPress 5.6 or newer and is normally available over HTTPS; site security
+settings can disable it. See the official
+[WordPress application password guide](https://developer.wordpress.org/advanced-administration/security/application-passwords/).
+
+### 4. Register the site in AIBroker (administrator)
+
+1. In AIBroker, open **Servers → + Add server**.
+2. Enter a recognizable name, for example `Company website`.
+3. In **IP address or hostname**, enter the site's hostname, for example
+   `example.com`, without `https://` or a path. Click **Save**.
+4. Click the new server's name, open **Plugins**, and click **+ Add plugin**.
+5. Select **WordPress** and use `WordPress` as the instance name.
+6. Fill in the configuration as follows, then click **Save**:
+
+   | Field | What to enter |
+   |-------|---------------|
+   | `base_url` / Base URL | The complete HTTPS base address from step 2, for example `https://example.com` or `https://example.com/blog`. The default is `https://${server.address}`; include a subdirectory if your site needs one. |
+   | `wordpress_path` / WordPress path | Leave empty for this REST-only setup. This is a filesystem path used for SSH operations. |
+   | `wp_cli_path` / WP CLI path | Leave the default `wp`; it is not needed for this REST connection. |
+
+Here, **WordPress plugin** means a connector inside AIBroker. You add it on the
+AIBroker page, not on WordPress's Plugins page.
+
+### 5. Save the credential and test the connection (administrator)
+
+1. In the WordPress plugin row, click **Add credential** (or **Replace credential**
+   if one is already stored).
+2. Enter the **WordPress username** from step 2 and the generated **Application
+   password** from step 3. Click **Save credential**.
+3. Click **Test connection** in that plugin row and wait for the result.
+4. Once the test succeeds, open the server's **Capabilities** tab to see which
+   operations are available. Some operations require additional WordPress
+   permissions or SSH access and may be unavailable with this setup.
+
+If another person performs this step, share the application password through your
+organization's approved secret-sharing method. Enter it only in the credential
+form, not in an AI conversation. AIBroker stores it encrypted and does not show
+it again.
+
+### 6. Grant your AIBroker account access (administrator)
+
+A successful connection test does not grant users access to the site. Add a
+binding: a rule connecting a group, a server, and a policy that specifies allowed
+actions.
+
+1. Open **Groups → + Add group**. Name it, for example, `Website readers`, add
+   an optional description, and click **Save**.
+2. Open that group, select **Members → + Add member**, choose the AIBroker
+   account that will use the AI client, and click **Save**.
+3. In the same group, select **Servers → + Bind server**.
+4. Choose `Company website` (or the name you used) and the built-in **read-only**
+   policy. Click **Save**. This lets you verify the connection with read operations.
+5. Use the group's **Effective access** tab to review the resulting permissions.
+
+Later, an administrator can change the binding to a policy allowing the required
+editing or publishing actions. WordPress also checks the permissions of the account
+whose application password you saved; a broker policy cannot grant permissions
+that account does not have.
+
+### 7. Connect your AI client and confirm it works
+
+1. Sign in to AIBroker as the account added to the group in step 6.
+2. Open **Tokens → + Add token**, enter a name such as `My AI client`, choose
+   an expiration, and save. If an administrator sees an owning-user selector,
+   select the account granted access in step 6.
+3. Copy the token immediately and store it securely. This token connects your AI
+   client to AIBroker; it is separate from the WordPress application password.
+4. Open **Client Setup**, enter the broker URL supplied by your administrator,
+   and select or paste the new token. Select your client's tab and follow its
+   displayed setup instructions. See [Connecting an AI client](#connecting-an-ai-client)
+   for the supported clients and configuration locations.
+5. Reload or restart your client if its setup instructions require it. Ask:
+   “Use AIBroker to list my WordPress sites, then list the pages on Company website.
+   Do not change anything.” Substitute your server name.
+6. Confirm your site appears and the page list is returned (an empty list is valid
+   if the site has no accessible pages). An administrator can check the server's
+   **Audit** tab for the corresponding calls.
+
+### If something goes wrong
+
+| What you see | What to do next |
+|--------------|-----------------|
+| No **Servers** or **Groups** in AIBroker | Ask an AIBroker administrator to complete steps 4–6. WordPress administrator status does not grant AIBroker administrator status. |
+| Connection test rejects the credential | Recheck the WordPress username and generated application password. If necessary, create a new application password and use **Replace credential**, then test again. |
+| Correct credentials still produce 401/403 | Ask the WordPress administrator or host to check the account's permissions, security rules, and whether the web server forwards the `Authorization` header to WordPress. |
+| API not reachable, 404, timeout, or certificate error | Check the plugin's HTTPS base URL, including any subdirectory. Ask the host and broker operator to verify that the broker can reach the REST API and that HTTPS works. A site reachable from your browser may still be blocked from the broker. |
+| Connection succeeds, but the AI cannot see the site or access is denied | Check that the token belongs to the user added to the group, the group has the correct server binding, and the server and plugin are enabled. Review **Effective access**. |
+| Reading works, but editing fails | Check both the AIBroker policy and the WordPress account's permissions. The initial **read-only** policy deliberately does not allow edits. |
+
+To disconnect this integration from WordPress, return to **Profile → Application
+Passwords**, find the `AIBroker` entry, and click **Revoke**. To replace its password,
+create a new one, save it through **Replace credential** in AIBroker, test the
+connection, and then revoke the old entry. Revoking an AIBroker token on **Tokens**
+instead disconnects that AI client.
 
 ---
 
@@ -522,6 +678,15 @@ Re-running reuses an existing server; use `wptest-rm` for a clean slate.
 
 Run `./dev.sh help` for the full list (build, run-image, k3s-smoke, wptest-* management,
 deps-status/deps-install, etc.).
+
+`run`, `run-image`, and `run --wptest NAME` hide routine HTTP request starts and
+successful completions from the console. Warnings, errors, failed HTTP responses,
+and other output remain visible. Full Compose output is saved per run in
+`data/logs/compose-*.log`; these files are not automatically rotated, so remove old
+ones when no longer needed. Container logging is unchanged. Use `./dev.sh logs`
+to follow unfiltered container logs, or `AIBROKER_CONSOLE_LOGS=full ./dev.sh run`
+to show everything in the foreground (also works with `run-image` and `--wptest`).
+Console filtering uses local Node.js; without it, the console shows full output.
 
 Local app data lives under `./data`. To fully reset the local app: stop the stack and
 delete `./data` — databases and the bootstrap admin are recreated on the next

@@ -6,4 +6,6 @@ COPY packages ./packages
 RUN corepack enable && pnpm install --frozen-lockfile
 USER pwuser
 EXPOSE 8090
-CMD ["./node_modules/.bin/tsx", "apps/browser-worker/src/index.ts"]
+# Login captures run headed under Xvfb (xvfb-run ships with the Playwright image).
+ENV AIBROKER_BROWSER_CAPTURE_HEADLESS=false
+CMD ["xvfb-run", "-a", "./node_modules/.bin/tsx", "apps/browser-worker/src/index.ts"]

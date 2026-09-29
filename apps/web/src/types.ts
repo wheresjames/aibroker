@@ -36,7 +36,7 @@ export type Server = {
 
 export type PluginType = {
   key: string; name: string; version: number; description: string; cardinality: "singleton" | "multi";
-  config_schema: { properties?: Record<string, { title?: string; type?: string | string[]; default?: unknown; enum?: string[]; items?: { type?: string } }> };
+  config_schema: { properties?: Record<string, { title?: string; description?: string; type?: string | string[]; default?: unknown; enum?: string[]; items?: { type?: string } }> };
   credential_kinds: string[];
   domains?: Array<{ key: string; label: string }>;
   access_levels?: Record<AccessLevel, { label: string; description: string; riskCeiling: ToolRisk | null; toolNames: string[] }>;

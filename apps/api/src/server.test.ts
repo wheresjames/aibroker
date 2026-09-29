@@ -28,8 +28,8 @@ const config: AIBrokerConfig = {
   artifactMaxRetentionSeconds: 604800,
 };
 
-function sessionHeaders(userId: string, expiresAt = Math.floor(Date.now() / 1000) + 3600) {
-  const payload = Buffer.from(JSON.stringify({ sub: userId, exp: expiresAt })).toString("base64url");
+function sessionHeaders(userId: string, expiresAt = Math.floor(Date.now() / 1000) + 3600, epoch?: number) {
+  const payload = Buffer.from(JSON.stringify({ sub: userId, exp: expiresAt, ...(epoch === undefined ? {} : { ep: epoch }) })).toString("base64url");
   const signature = createHmac("sha256", config.sessionSecret).update(payload).digest("base64url");
   return { "x-aibroker-session": `${payload}.${signature}` };
 }
@@ -130,6 +130,22 @@ describe("bootstrap admin", () => {
     expect(statements.some((statement) => statement.includes("insert into users"))).toBe(true);
     expect(messages.join("\n")).toContain("Username: admin@example.com");
     expect(messages.join("\n")).toContain("Password: temporary-password");
+  });
+
+  it("never logs the password, and refuses the built-in default, in production", async () => {
+    const messages: string[] = [];
+    const db = {
+      query: async (sql: string) => {
+        if (sql.includes("count(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 };
+        if (sql.includes("select password_change_required")) return { rows: [{ password_change_required: true }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      }
+    };
+    const logger = { warn: (message: string) => messages.push(message) };
+    await expect(ensureBootstrapAdmin(db as never, { NODE_ENV: "production" } as NodeJS.ProcessEnv, logger)).rejects.toThrow("default password");
+    await ensureBootstrapAdmin(db as never, { NODE_ENV: "production", AIBROKER_BOOTSTRAP_ADMIN_PASSWORD: "s3cret-initial-value" } as NodeJS.ProcessEnv, logger);
+    expect(messages.join("\n")).toContain("Username: admin@example.com");
+    expect(messages.join("\n")).not.toContain("s3cret-initial-value");
   });
 
   it("does not print credentials after the bootstrap password was changed", async () => {
@@ -706,5 +722,96 @@ describe("Phase 1 catalog + effective access", () => {
     expect(body.connector.required_executor).toBe("rest");
     expect(body.connector.credential_status).toBe("present");
     expect(body.tool.domain).toBe("content");
+  });
+});
+
+describe("security regressions", () => {
+  it.each(["/%61dmin/summary", "/%61dmin/groups", "/%61dmin/bindings", "/%61dmin/tools"])(
+    "does not let a percent-encoded path skip admin auth (%s)",
+    async (url) => {
+      const server = await buildServer({
+        config,
+        db: { query: async () => { throw new Error("unauthenticated request reached the database"); } } as never
+      });
+      const response = await server.inject({ method: "GET", url });
+      expect(response.statusCode).toBe(401);
+    }
+  );
+
+  it("rejects a session issued under an earlier epoch", async () => {
+    const db = {
+      query: async (sql: string) => {
+        if (sql.includes("select id, owner_user_id, email")) return { rows: [{ ...activeUserRow("admin-1", "global_admin"), session_epoch: 2 }], rowCount: 1 };
+        return { rows: [{ count: 0 }], rowCount: 1 };
+      }
+    };
+    const server = await buildServer({ config, db: db as never });
+    const stale = await server.inject({ method: "GET", url: "/admin/summary", headers: sessionHeaders("admin-1", undefined, 1) });
+    expect(stale.statusCode).toBe(401);
+    const current = await server.inject({ method: "GET", url: "/admin/summary", headers: sessionHeaders("admin-1", undefined, 2) });
+    expect(current.statusCode).toBe(200);
+  });
+
+  it("logout bumps the session epoch", async () => {
+    const statements: Array<{ sql: string; params: unknown[] }> = [];
+    const db = { query: async (sql: string, params: unknown[] = []) => { statements.push({ sql, params }); return { rows: [], rowCount: 1 }; } };
+    const server = await buildServer({ config, db: db as never });
+    const response = await server.inject({ method: "POST", url: "/auth/logout", headers: sessionHeaders("admin-1", undefined, 3) });
+    expect(response.statusCode).toBe(200);
+    expect(statements.find((s) => s.sql.includes("session_epoch = session_epoch + 1"))?.params).toEqual(["admin-1", 3]);
+  });
+
+  it("does not let a team admin disable another team admin in their subtree", async () => {
+    let mutated = false;
+    const db = {
+      query: async (sql: string) => {
+        if (sql.includes("select id, owner_user_id, email")) return { rows: [activeUserRow("team-a", "team_admin")], rowCount: 1 };
+        if (sql.includes("with recursive scope")) return { rows: [{ "?column?": 1 }], rowCount: 1 };
+        if (sql.startsWith("select role from users")) return { rows: [{ role: "team_admin" }], rowCount: 1 };
+        if (sql.startsWith("update users")) mutated = true;
+        return { rows: [], rowCount: 0 };
+      }
+    };
+    const server = await buildServer({ config, db: db as never });
+    const response = await server.inject({ method: "POST", url: "/admin/users/team-b/disable", headers: sessionHeaders("team-a") });
+    expect(response.statusCode).toBe(403);
+    expect(mutated).toBe(false);
+  });
+
+  it("refuses to disable the last active global admin", async () => {
+    const db = {
+      query: async (sql: string) => {
+        if (sql.includes("select id, owner_user_id, email")) return { rows: [activeUserRow("admin-1", "global_admin")], rowCount: 1 };
+        if (sql.startsWith("select role from users")) return { rows: [{ role: "global_admin" }], rowCount: 1 };
+        if (sql.includes("role = 'global_admin' and status = 'active' and id <> $1")) return { rows: [], rowCount: 0 };
+        if (sql.startsWith("update users")) throw new Error("must not disable the last global admin");
+        return { rows: [], rowCount: 0 };
+      }
+    };
+    const server = await buildServer({ config, db: db as never });
+    const response = await server.inject({ method: "POST", url: "/admin/users/admin-1/disable", headers: sessionHeaders("admin-1") });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("last_global_admin");
+  });
+
+  it("throttles repeated failed logins", async () => {
+    const db = {
+      query: async (sql: string) => {
+        if (sql.includes("email_failures")) return { rows: [{ email_failures: 10, ip_failures: 0 }], rowCount: 1 };
+        throw new Error("a throttled login must not look up the user");
+      }
+    };
+    const server = await buildServer({ config, db: db as never });
+    const response = await server.inject({ method: "POST", url: "/auth/login", payload: { email: "a@example.com", password: "x" } });
+    expect(response.statusCode).toBe(429);
+  });
+
+  it("requires the metrics token when configured, and disables metrics in production without one", async () => {
+    const db = { query: async () => ({ rows: [{ count: 0 }], rowCount: 1 }) };
+    const guarded = await buildServer({ config: { ...config, metricsToken: "m-token" }, db: db as never });
+    expect((await guarded.inject({ method: "GET", url: "/metrics" })).statusCode).toBe(401);
+    expect((await guarded.inject({ method: "GET", url: "/metrics", headers: { authorization: "Bearer m-token" } })).statusCode).toBe(200);
+    const production = await buildServer({ config: { ...config, nodeEnv: "production" }, db: db as never });
+    expect((await production.inject({ method: "GET", url: "/metrics" })).statusCode).toBe(404);
   });
 });

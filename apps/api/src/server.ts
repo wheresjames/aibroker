@@ -6,7 +6,8 @@ import { redactObject, redactValue, validateBindingConstraints, validateConstrai
 import { loadEncryptionKey, decryptJson, encryptJson, type EncryptedPayload } from "@aibroker/crypto";
 import { writeAuditEvent } from "@aibroker/audit";
 import { evaluatePolicy } from "@aibroker/policy";
-import { WordPressRestClient, WordPressRestError } from "@aibroker/wordpress-rest";
+import { WordPressRestClient, WordPressRestError, WordPressSessionError, type PendingTwoFactor } from "@aibroker/wordpress-rest";
+import { PAGE_BUILDER_ADAPTERS, PAGE_BUILDER_TOOL_HANDLERS, type PageBuilderToolCtx } from "@aibroker/page-builders";
 import { TOOL_ACTIONS, TOOL_DOMAINS, type ToolDefinition } from "@aibroker/mcp-tools";
 import {
   ACCESS_LEVELS,
@@ -21,11 +22,16 @@ import {
   type ServerPluginContext
 } from "@aibroker/plugin-sdk";
 import { createBuiltInPluginRegistry, wordpressPlugin, sshPlugin, postgresPlugin } from "@aibroker/plugin-catalog";
-import { normalizePlaywrightConfig } from "@aibroker/plugin-playwright";
+import { assertAuthenticatedBrowserScope, normalizePlaywrightConfig } from "@aibroker/plugin-playwright";
 import { FilesystemArtifactStore, S3ArtifactStore, type ArtifactStore } from "@aibroker/artifacts";
 import { executeElevatedSshScript, executeSshCommand } from "@aibroker/wpcli-ssh";
 import { recordServerPluginCapabilities } from "@aibroker/db";
 import { REST_TOOL_HANDLERS, type RestToolCtx } from "./tools/rest-tools.js";
+import {
+  completeWordPressTwoFactor, connectWordPressSession, disconnectWordPressSession, loadWordPressSession, markSessionExpired, SessionConnectError,
+  snapshotStore, storeBrowserCapturedSession
+} from "./tools/wordpress-sessions.js";
+import { captureOrigins, CHALLENGE_PROVIDER_ORIGINS, createCapture, finishCapture, loadCapture, MAX_TWO_FACTOR_ATTEMPTS, updateCapturePayload } from "./tools/credential-captures.js";
 import type pg from "pg";
 import { Pool as PgPool } from "pg";
 import { createMcpPipeline, McpToolError, type McpAuditContext, type McpPipeline } from "./mcp/pipeline.js";
@@ -47,17 +53,18 @@ interface AdminUser {
   role: string;
   status: string;
   password_change_required: boolean;
+  session_epoch?: number;
 }
 
 const SESSION_TTL_SECONDS = 6 * 24 * 60 * 60;
 
-function issueSessionToken(userId: string, secret: string): string {
-  const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS })).toString("base64url");
+function issueSessionToken(userId: string, epoch: number, secret: string): string {
+  const payload = Buffer.from(JSON.stringify({ sub: userId, ep: epoch, exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS })).toString("base64url");
   const signature = createHmac("sha256", secret).update(payload).digest("base64url");
   return `${payload}.${signature}`;
 }
 
-function verifySessionToken(token: string, secret: string): string | null {
+function verifySessionToken(token: string, secret: string): { sub: string; ep: number } | null {
   const [payload, signature, extra] = token.split(".");
   if (!payload || !signature || extra) return null;
   const expected = createHmac("sha256", secret).update(payload).digest();
@@ -65,9 +72,9 @@ function verifySessionToken(token: string, secret: string): string | null {
   try { supplied = Buffer.from(signature, "base64url"); } catch { return null; }
   if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
   try {
-    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { sub?: unknown; exp?: unknown };
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { sub?: unknown; ep?: unknown; exp?: unknown };
     if (typeof parsed.sub !== "string" || typeof parsed.exp !== "number" || parsed.exp <= Math.floor(Date.now() / 1000)) return null;
-    return parsed.sub;
+    return { sub: parsed.sub, ep: typeof parsed.ep === "number" ? parsed.ep : 0 };
   } catch { return null; }
 }
 
@@ -160,7 +167,11 @@ export async function ensureBootstrapAdmin(
     [email]
   );
   const bootstrapUser = bootstrap.rows[0];
+  const production = env.NODE_ENV === "production";
   if (Number(admins.rows[0]?.count ?? 0) === 0 || (bootstrapUser && !bootstrapUser.password_change_required && !bootstrapUser.last_login_at)) {
+    if (production && password === DEFAULT_BOOTSTRAP_ADMIN_PASSWORD) {
+      throw new Error("Refusing to create the bootstrap admin with the built-in default password in production; set AIBROKER_BOOTSTRAP_ADMIN_PASSWORD");
+    }
     const passwordHash = await hashPassword(password);
     await db.query(
       `insert into users (email, display_name, password_hash, password_change_required, role, status)
@@ -185,7 +196,8 @@ export async function ensureBootstrapAdmin(
       [
         "AIBroker bootstrap admin password must be changed.",
         `Username: ${email}`,
-        `Password: ${password}`
+        // Production logs are shipped and retained, so never write the credential there.
+        production ? "Password: the value of AIBROKER_BOOTSTRAP_ADMIN_PASSWORD" : `Password: ${password}`
       ].join("\n")
     );
   }
@@ -222,7 +234,10 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
   server.addHook("onClose", async () => { clearInterval(artifactCleanup); clearInterval(browserSessionReconciliation); });
 
   server.addHook("preHandler", async (request, reply) => {
-    if (!request.url.startsWith("/admin/")) return;
+    // Match on the routed path, not the raw URL: the router percent-decodes before
+    // matching, so a raw-URL check is bypassed by e.g. /%61dmin/groups. Unmatched
+    // requests (404s) have no route, so fall back to the raw URL for those.
+    if (!(request.routeOptions.url ?? request.url).startsWith("/admin/")) return;
     const actor = await requireAdmin(options.db, request, reply);
     if (!actor || reply.sent) return;
   });
@@ -244,7 +259,8 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
 
   server.get("/admin/sandbox", async (request, reply) => {
     if (!options.config.sandboxEnabled) return error(reply, 404, "sandbox_disabled");
-    const actor = await requireAdmin(options.db, request, reply); if (!actor) return;
+    // Returns decrypted sandbox secrets, so it is gated like the other sandbox routes.
+    const actor = await requireGlobalAdmin(options.db, request, reply); if (!actor) return;
     const result = await options.db.query(
       "select id,plugin_key,name,status,connection_config,encrypted_secrets,registered_server_id,created_at,expires_at,torn_down_at from sandbox_targets order by created_at desc"
     );
@@ -321,7 +337,16 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     return { ok: true };
   });
 
-  server.get("/metrics", async (_request, reply) => {
+  server.get("/metrics", async (request, reply) => {
+    // Bearer-protected when AIBROKER_METRICS_TOKEN is set; never public in production.
+    const metricsToken = options.config.metricsToken;
+    if (metricsToken) {
+      const supplied = Buffer.from(request.headers.authorization ?? "");
+      const expected = Buffer.from(`Bearer ${metricsToken}`);
+      if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return error(reply, 401, "unauthenticated");
+    } else if (options.config.nodeEnv === "production") {
+      return error(reply, 404, "metrics_disabled", "Set AIBROKER_METRICS_TOKEN to enable /metrics in production.");
+    }
     const [
       toolCalls,
       failures,
@@ -387,8 +412,10 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     const password = request.body.password ?? "";
     if (!email || !password) return error(reply, 400, "validation_error");
 
+    if (await loginThrottled(options.db, email, request.ip)) return error(reply, 429, "too_many_attempts", "Too many failed sign-in attempts. Try again later.");
     const user = await findUserByEmail(options.db, email);
-    const valid = user && user.status === "active" && (await verifyPassword(password, user.password_hash));
+    const valid = await checkPassword(user, password);
+    if (!valid) await recordLoginFailure(options.db, email, request.ip);
     await auditFromRequest(options.db, request, {
       eventType: "admin_login",
       status: valid ? "success" : "failure",
@@ -397,9 +424,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
       ...(valid ? {} : { errorCode: "invalid_credentials" })
     });
 
-    if (!valid) return error(reply, 401, "invalid_credentials");
+    if (!valid || !user) return error(reply, 401, "invalid_credentials");
     await options.db.query("update users set last_login_at = now() where id = $1", [user.id]);
-    return { user: publicUser(user), password_change_required: user.password_change_required, session_token: issueSessionToken(user.id, options.config.sessionSecret) };
+    return { user: publicUser(user), password_change_required: user.password_change_required, session_token: issueSessionToken(user.id, user.session_epoch ?? 0, options.config.sessionSecret) };
   });
 
   server.post<{ Body: { email?: string; current_password?: string; new_password?: string } }>("/auth/change-password", async (request, reply) => {
@@ -412,8 +439,10 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     }
     if (currentPassword === newPassword) return error(reply, 400, "validation_error", "New password must be different from the bootstrap password.");
 
+    if (await loginThrottled(options.db, email, request.ip)) return error(reply, 429, "too_many_attempts", "Too many failed sign-in attempts. Try again later.");
     const user = await findUserByEmail(options.db, email);
-    const valid = user && user.status === "active" && (await verifyPassword(currentPassword, user.password_hash));
+    const valid = await checkPassword(user, currentPassword);
+    if (!valid) await recordLoginFailure(options.db, email, request.ip);
     await auditFromRequest(options.db, request, {
       eventType: "admin_password_change",
       status: valid ? "success" : "failure",
@@ -422,31 +451,52 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
       ...(valid ? {} : { errorCode: "invalid_credentials" })
     });
 
-    if (!valid) return error(reply, 401, "invalid_credentials");
+    if (!valid || !user) return error(reply, 401, "invalid_credentials");
 
     const passwordHash = await hashPassword(newPassword);
     const result = await options.db.query<AdminUser>(
       `update users
-       set password_hash = $2, password_change_required = false, updated_at = now(), last_login_at = now()
+       set password_hash = $2, password_change_required = false, updated_at = now(), last_login_at = now(),
+           session_epoch = session_epoch + 1
        where id = $1
-       returning id, email, display_name, role, status, password_change_required`,
+       returning id, email, display_name, role, status, password_change_required, session_epoch`,
       [user.id, passwordHash]
     );
     const updatedUser = result.rows[0];
     if (!updatedUser) return error(reply, 404, "user_not_found");
-    return { user: publicUser(updatedUser), password_change_required: false, session_token: issueSessionToken(updatedUser.id, options.config.sessionSecret) };
+    return { user: publicUser(updatedUser), password_change_required: false, session_token: issueSessionToken(updatedUser.id, updatedUser.session_epoch ?? 0, options.config.sessionSecret) };
   });
 
-  server.get("/admin/bootstrap", async () => ({
-    app: "AIBroker",
-    navigation: ["Dashboard", "Users", "Groups", "Servers", "Tokens", "Policies", "Audit Logs", "Client Setup"],
-    features: {
-      mcpEnabled: options.config.mcpEnabled,
-      authorization: "policy"
+  // Revokes every session token the user holds (all devices), not just this one.
+  server.post("/auth/logout", async (request, reply) => {
+    const claims = await sessionClaims(request, options.config.sessionSecret);
+    if (!claims) return error(reply, 401, "auth_required");
+    const result = await options.db.query(
+      "update users set session_epoch = session_epoch + 1 where id = $1 and session_epoch = $2",
+      [claims.sub, claims.ep]
+    );
+    if (result.rowCount) {
+      await auditFromRequest(options.db, request, { eventType: "admin_logout", actorUserId: claims.sub, status: "success" });
     }
-  }));
+    return { ok: true };
+  });
 
-  server.get("/admin/summary", async (_request, reply) => {
+  server.get("/admin/bootstrap", async (request, reply) => {
+    const actor = await requireAdmin(options.db, request, reply);
+    if (!actor) return;
+    return {
+      app: "AIBroker",
+      navigation: ["Dashboard", "Users", "Groups", "Servers", "Tokens", "Policies", "Audit Logs", "Client Setup"],
+      features: {
+        mcpEnabled: options.config.mcpEnabled,
+        authorization: "policy"
+      }
+    };
+  });
+
+  server.get("/admin/summary", async (request, reply) => {
+    const actor = await requireAdmin(options.db, request, reply);
+    if (!actor) return;
     const [users, servers, tokens, audit] = await Promise.all([
       scalar(options.db, "select count(*)::int as count from users"),
       scalar(options.db, "select count(*)::int as count from servers"),
@@ -547,6 +597,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     const role = request.body.role ?? before.rows[0].role;
     if (!displayName || !email || !isRole(role) || !isUserStatus(status)) return error(reply, 400, "validation_error");
     if (["global_admin", "team_admin"].includes(role) && actor.role !== "global_admin") return error(reply, 403, "admin_denied");
+    if (before.rows[0].role === "global_admin" && (role !== "global_admin" || status !== "active") && (await isLastGlobalAdmin(options.db, userId))) {
+      return error(reply, 409, "last_global_admin", "At least one active global admin must remain.");
+    }
     const taken = await options.db.query("select id from users where email = $1 and id <> $2", [email, userId]);
     if (taken.rowCount) return error(reply, 409, "email_taken", "That email is already in use.");
     // global_admin must have no owner; other roles keep their existing owner.
@@ -658,6 +711,13 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     const actor = await requireAdmin(options.db, request, reply);
     if (!actor) return;
     if (!(await canManageUser(options.db, actor, request.params.id))) return error(reply, 403, "admin_denied");
+    // Same rule as PATCH /admin/users/:id: only global admins may act on admin accounts.
+    const target = await options.db.query<{ role: string }>("select role from users where id = $1", [request.params.id]);
+    if (!target.rows[0]) return error(reply, 404, "user_not_found");
+    if (["global_admin", "team_admin"].includes(target.rows[0].role) && actor.role !== "global_admin") return error(reply, 403, "admin_denied");
+    if (target.rows[0].role === "global_admin" && (await isLastGlobalAdmin(options.db, request.params.id))) {
+      return error(reply, 409, "last_global_admin", "At least one active global admin must remain.");
+    }
     await options.db.query("update users set status = 'disabled', updated_at = now() where id = $1", [request.params.id]);
     await auditFromRequest(options.db, request, {
       eventType: "user_disable",
@@ -668,7 +728,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     return { ok: true };
   });
 
-  server.get("/admin/groups", async () => {
+  server.get("/admin/groups", async (request, reply) => {
+    const actor = await requireAdmin(options.db, request, reply);
+    if (!actor) return;
     const groups = await options.db.query(
       `select g.id, g.name, g.description, g.owner_user_id, owner.display_name as owner_display_name, g.created_at,
               (select count(*)::int from group_memberships gm where gm.group_id = g.id) as member_count,
@@ -979,9 +1041,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
       `select sp.*,p.name as plugin_name,p.version,p.config_schema,coalesce(pr.status,ppr.status) as provisioning_status,
               coalesce(pr.profile,jsonb_build_object('username',ppr.scoped_role,'allowed_schemas',ppr.allowed_schemas)) as provisioning_profile,
               (select count(*)::int from server_capabilities sc where sc.server_plugin_id=sp.id and sc.status='available') as capability_count,
-              exists(select 1 from server_credentials sc where sc.server_plugin_id=sp.id
+              exists(select 1 from server_credentials sc where sc.server_plugin_id=sp.id and sc.owner_user_id is null
                 and sc.kind in (select jsonb_array_elements_text(p.credential_kinds)) and sc.status='active') as has_active_credential,
-              (select sc.created_at from server_credentials sc where sc.server_plugin_id=sp.id
+              (select sc.created_at from server_credentials sc where sc.server_plugin_id=sp.id and sc.owner_user_id is null
                 and sc.kind in (select jsonb_array_elements_text(p.credential_kinds)) and sc.status='active'
                 order by sc.created_at desc limit 1) as active_credential_created_at
        from server_plugins sp join plugins p on p.key=sp.plugin_key
@@ -1076,7 +1138,7 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
       if (!serverRow.rows[0]) return error(reply, 404, "server_not_found");
       const serverContext = { ...serverRow.rows[0], metadata: serverRow.rows[0].metadata ?? {} };
       let config = request.body.config ?? plugin.defaultConfig?.(serverContext) ?? (plugin.key === "wordpress"
-        ? { base_url: "http://${server.address}" }
+        ? { base_url: "https://${server.address}" }
         : plugin.key === "ssh"
           ? { host: "${server.address}", port: 22, username: "aibroker", workspace_root: "/var/www/html" }
           : { host: "${server.address}", port: 5432, database: "postgres", scoped_role: "aibroker_scoped", allowed_schemas: ["public"], named_queries: {} });
@@ -1333,6 +1395,12 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
         if (plugin.key === "playwright") {
           try { validatePlaywrightEnvironment(nextConfig, { address: serverRow.rows[0]!.address }, options.config); }
           catch (err) { return error(reply, 400, "validation_error", err instanceof Error ? err.message : "Invalid browser target"); }
+          const authenticated = await options.db.query(
+            "select 1 from server_credentials where server_plugin_id=$1 and kind='browser_storage_state' and status='active' limit 1", [request.params.pluginId]);
+          if (authenticated.rowCount) {
+            try { assertAuthenticatedBrowserScope(nextConfig); }
+            catch (err) { return error(reply, 400, "validation_error", err instanceof Error ? err.message : "Invalid browser scope"); }
+          }
         }
       }
       if (plugin?.key === "postgres" && nextConfig) {
@@ -1349,6 +1417,36 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
         serverId: request.params.id, status: "success", input: plugin?.auditDiff?.(before.rows[0], updated.rows[0]) ?? { before: before.rows[0], after: updated.rows[0] } });
       if (plugin?.key === "playwright" && nextConfig) await closeBrowserSessionsForPlugin(options.db, options.config, request.params.pluginId, "configuration_changed");
       return { plugin: updated.rows[0] };
+    }
+  );
+
+  // Capture Playwright's stored browser state by logging in through the live remote
+  // browser instead of pasting cookie JSON (shared capture service).
+  server.post<{ Params: { id: string; pluginId: string }; Body: { start_url?: string } }>(
+    "/admin/servers/:id/plugins/:pluginId/credential/capture", async (request, reply) => {
+      const actor = await requireAdmin(options.db, request, reply); if (!actor) return;
+      if (!(await canManageServer(options.db, actor, request.params.id))) return error(reply, 403, "admin_denied");
+      const target = await getServerPlugin(options.db, request.params.pluginId);
+      if (!target || target.server.id !== request.params.id || target.pluginKey !== "playwright") return error(reply, 404, "server_plugin_not_found");
+      try { assertAuthenticatedBrowserScope(target.config); }
+      catch (err) { return error(reply, 400, "validation_error", err instanceof Error ? err.message : "Invalid browser scope"); }
+      const origins = (target.config.allowed_origins as unknown[]).map(String);
+      const startUrl = request.body?.start_url ? String(request.body.start_url) : String(target.config.base_url);
+      let start: URL;
+      try { start = new URL(startUrl); } catch { return error(reply, 400, "validation_error", "start_url must be a URL"); }
+      if (!origins.includes(start.origin)) return error(reply, 400, "browser_destination_denied", "start_url must be on one of the instance's allowed origins");
+      const captureId = await createCapture(options.db, options.config, { serverPluginId: target.id, ownerUserId: actor.id, kind: "playwright_browser" });
+      try {
+        const frame = await browserRpc(options.config, {
+          capture_id: captureId, url: start.toString(), allowed_origins: [...new Set([...origins, ...CHALLENGE_PROVIDER_ORIGINS])].slice(0, 20),
+          ...captureBrowserDefaults(options.config, String(target.config.base_url), target)
+        }, "/v1/capture/start");
+        return { capture_id: captureId, frame };
+      } catch (err) {
+        await finishCapture(options.db, captureId, "failed");
+        const mapped = mapToolError(err);
+        return error(reply, mapped.status, mapped.code, mapped.message);
+      }
     }
   );
 
@@ -1419,20 +1517,25 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
       if (!(await canManageServer(options.db, actor, request.params.id))) return error(reply, 403, "admin_denied");
       const target = await getServerPlugin(options.db, request.params.pluginId);
       if (!target || target.server.id !== request.params.id) return error(reply, 404, "server_plugin_not_found");
-      let kind: string, secret: Record<string, unknown>;
       if (target.pluginKey === "playwright") {
-        const state = validateBrowserStorageState(request.body.storage_state, target);
-        kind = "browser_storage_state"; secret = { version: 1, allowedOrigins: target.config.allowed_origins, storageState: state };
-      } else {
-        if (!request.body.username || !request.body.application_password) return error(reply, 400, "validation_error");
-        kind = "wordpress_rest_application_password"; secret = { username: request.body.username, applicationPassword: request.body.application_password };
+        try {
+          const credential = await storeBrowserStorageState(options.db, options.config, target, request.body.storage_state);
+          await auditFromRequest(options.db, request, { eventType: "server_plugin_credential_replace", actorUserId: actor.id,
+            serverId: target.server.id, status: "success", input: { server_plugin_id: target.id, kind: "browser_storage_state" } });
+          return { credential };
+        } catch (err) {
+          const mapped = mapToolError(err);
+          return error(reply, mapped.status, mapped.code, mapped.message);
+        }
       }
+      if (!request.body.username || !request.body.application_password) return error(reply, 400, "validation_error");
+      const kind = "wordpress_rest_application_password";
+      const secret = { username: request.body.username, applicationPassword: request.body.application_password };
       const encrypted = encryptJson(secret, loadEncryptionKey(options.config.encryptionKeyBase64));
       await options.db.query("update server_credentials set status='replaced',replaced_at=now() where server_plugin_id=$1 and kind=$2 and status='active'", [target.id, kind]);
       const credential = await options.db.query(
         `insert into server_credentials(server_plugin_id,kind,encrypted_payload) values($1,$2,$3::jsonb)
          returning id,server_plugin_id,kind,status,created_at`, [target.id,kind,JSON.stringify(encrypted)]);
-      if (target.pluginKey === "playwright") await closeBrowserSessionsForPlugin(options.db, options.config, target.id, "credential_replaced");
       await auditFromRequest(options.db, request, { eventType: "server_plugin_credential_replace", actorUserId: actor.id,
         serverId: target.server.id, status: "success", input: { server_plugin_id: target.id, kind } });
       return { credential: credential.rows[0] };
@@ -1587,9 +1690,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     return{provider:provider.rows[0]};
   });
 
-  server.get("/admin/recovery",async(request,reply)=>{const actor=await requireAdmin(options.db,request,reply);if(!actor)return;const backups=await options.db.query("select b.*,s.name server_name from backups b join servers s on s.id=b.server_id where b.deleted_at is null order by b.created_at desc limit 200");const restores=await options.db.query("select r.*,s.name server_name from restore_history r join servers s on s.id=r.server_id order by r.created_at desc limit 100");const deployments=await options.db.query("select d.*,s.name server_name from deployments d join servers s on s.id=d.server_id order by d.created_at desc limit 100");const operations=await options.db.query("select o.id,o.server_id,s.name server_name,o.tool_name,o.status,o.progress,o.error_code,o.created_at,o.finished_at from host_operations o join servers s on s.id=o.server_id where o.tool_name like 'backup_%' or o.tool_name like 'database_%' or o.tool_name like 'hosting_%' or o.tool_name like 'network_%' order by o.created_at desc limit 300");const providers=await options.db.query("select p.id,p.adapter_id,p.base_url,p.api_version,p.status,p.last_discovered_at,s.name server_name from hosting_providers p join servers s on s.id=p.server_id order by s.name");return{backups:backups.rows,restores:restores.rows,deployments:deployments.rows,operations:operations.rows,providers:providers.rows};});
+  server.get("/admin/recovery",async(request,reply)=>{const actor=await requireAdmin(options.db,request,reply);if(!actor)return;const scope=await managedServerIds(options.db,actor);const scoped=(alias:string)=>scope?`${alias}.server_id=any($1::uuid[])`:"true";const params=scope?[scope]:[];const backups=await options.db.query(`select b.*,s.name server_name from backups b join servers s on s.id=b.server_id where b.deleted_at is null and ${scoped("b")} order by b.created_at desc limit 200`,params);const restores=await options.db.query(`select r.*,s.name server_name from restore_history r join servers s on s.id=r.server_id where ${scoped("r")} order by r.created_at desc limit 100`,params);const deployments=await options.db.query(`select d.*,s.name server_name from deployments d join servers s on s.id=d.server_id where ${scoped("d")} order by d.created_at desc limit 100`,params);const operations=await options.db.query(`select o.id,o.server_id,s.name server_name,o.tool_name,o.status,o.progress,o.error_code,o.created_at,o.finished_at from host_operations o join servers s on s.id=o.server_id where (o.tool_name like 'backup_%' or o.tool_name like 'database_%' or o.tool_name like 'hosting_%' or o.tool_name like 'network_%') and ${scoped("o")} order by o.created_at desc limit 300`,params);const providers=await options.db.query(`select p.id,p.adapter_id,p.base_url,p.api_version,p.status,p.last_discovered_at,s.name server_name from hosting_providers p join servers s on s.id=p.server_id where ${scoped("p")} order by s.name`,params);return{backups:backups.rows,restores:restores.rows,deployments:deployments.rows,operations:operations.rows,providers:providers.rows};});
 
-  server.get("/admin/networks",async(request,reply)=>{const actor=await requireAdmin(options.db,request,reply);if(!actor)return;const result=await options.db.query(`select n.*,coalesce(json_agg(json_build_object('id',s.id,'name',s.name,'network_server_id',m.network_server_id)) filter(where s.id is not null),'[]') servers from wordpress_networks n left join wordpress_network_servers m on m.network_id=n.id left join servers s on s.id=m.server_id group by n.id order by n.name`);return{networks:result.rows};});
+  server.get("/admin/networks",async(request,reply)=>{const actor=await requireAdmin(options.db,request,reply);if(!actor)return;const scope=await managedServerIds(options.db,actor);const result=await options.db.query(`select n.*,coalesce(json_agg(json_build_object('id',s.id,'name',s.name,'network_server_id',m.network_server_id)) filter(where s.id is not null),'[]') servers from wordpress_networks n left join wordpress_network_servers m on m.network_id=n.id left join servers s on s.id=m.server_id ${scope?"where n.primary_server_id=any($1::uuid[])":""} group by n.id order by n.name`,scope?[scope]:[]);return{networks:result.rows};});
   server.post<{Body:{name?:string;primary_server_id?:string;domain?:string;base_path?:string}}>("/admin/networks",async(request,reply)=>{const actor=await requireAdmin(options.db,request,reply);if(!actor)return;if(!request.body.name||!request.body.primary_server_id||!request.body.domain)return error(reply,400,"validation_error");if(!(await canManageServer(options.db,actor,request.body.primary_server_id)))return error(reply,403,"admin_denied");const credential=await options.db.query<{id:string}>(`select sc.id from server_plugins sp join server_credentials sc on sc.server_plugin_id=sp.id where sp.server_id=$1 and sp.plugin_key='ssh' and sp.status='enabled' and sc.kind='ssh_private_key' and sc.status='active' order by sc.created_at desc limit 1`,[request.body.primary_server_id]);const client=await options.db.connect();try{await client.query("begin");const created=await client.query<{id:string}>("insert into wordpress_networks(name,primary_server_id,credential_id,domain,base_path) values($1,$2,$3,$4,$5) returning *",[request.body.name,request.body.primary_server_id,credential.rows[0]?.id??null,request.body.domain,request.body.base_path??"/"]);await client.query("insert into wordpress_network_servers(network_id,server_id,network_server_id) values($1,$2,1)",[created.rows[0]!.id,request.body.primary_server_id]);await client.query("commit");return{network:created.rows[0]};}catch(err){await client.query("rollback");throw err;}finally{client.release();}});
 
   server.post<{ Params: { id: string }; Body: { name?: string; remote_root?: string; kind?: "plugin" | "theme"; allowed_extensions?: string[]; max_file_bytes?: number; commands?: Record<string, string[]>; direct_live_edit?: boolean } }>("/admin/servers/:id/workspaces", async (request, reply) => {
@@ -1618,6 +1721,237 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     const groups=await options.db.query<{group_id:string}>("select group_id from group_memberships where user_id=$1",[actor.id]);
     const result=await options.db.query(`select distinct s.id,s.name,c.server_plugin_id,c.mode,c.connection_status from servers s join ssh_connectors c on c.server_id=s.id join server_bindings b on b.server_id=s.id where s.status='active' and ((b.subject_type='user' and b.subject_id=$1) or (b.subject_type='group' and b.subject_id=any($2::uuid[]))) order by s.name`,[actor.id,groups.rows.map(r=>r.group_id)]);
     return {servers:result.rows};
+  });
+
+  // ---- WordPress login sessions (AB-ELEMENTOR D1): each user connects their own ----
+  const boundWordPressPlugin = async (actor: AdminUser, serverPluginId: string): Promise<ServerPluginTarget | null> => {
+    if (!/^[0-9a-f-]{36}$/i.test(serverPluginId)) return null;
+    const groups = await options.db.query<{ group_id: string }>("select group_id from group_memberships where user_id=$1", [actor.id]);
+    const bound = await options.db.query(
+      `select 1 from server_plugins sp join servers s on s.id=sp.server_id and s.status='active'
+       join server_bindings b on b.server_id=s.id
+       where sp.id=$1 and sp.plugin_key='wordpress' and sp.status='enabled'
+         and ((b.subject_type='user' and b.subject_id=$2) or (b.subject_type='group' and b.subject_id=any($3::uuid[]))) limit 1`,
+      [serverPluginId, actor.id, groups.rows.map((row) => row.group_id)]);
+    return bound.rowCount ? getServerPlugin(options.db, serverPluginId) : null;
+  };
+
+  server.get("/me/wordpress-sessions", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const groups = await options.db.query<{ group_id: string }>("select group_id from group_memberships where user_id=$1", [actor.id]);
+    const result = await options.db.query<{
+      server_plugin_id: string; instance_name: string; server_id: string; server_name: string;
+      session_status: string | null; expires_at: string | null; metadata: Record<string, unknown> | null; connected_at: string | null; last_used_at: string | null;
+    }>(
+      `select distinct on (sp.id) sp.id as server_plugin_id, sp.instance_name, s.id as server_id, s.name as server_name,
+              sc.status as session_status, sc.expires_at, sc.metadata, sc.created_at as connected_at, sc.last_used_at
+       from servers s
+       join server_plugins sp on sp.server_id=s.id and sp.plugin_key='wordpress' and sp.status='enabled'
+       join server_bindings b on b.server_id=s.id
+       left join lateral (
+         select c.status, c.expires_at, c.metadata, c.created_at, c.last_used_at from server_credentials c
+         where c.server_plugin_id=sp.id and c.owner_user_id=$1 and c.kind='wordpress_session' and c.status in ('active','expired')
+         order by c.created_at desc limit 1
+       ) sc on true
+       where s.status='active' and ((b.subject_type='user' and b.subject_id=$1) or (b.subject_type='group' and b.subject_id=any($2::uuid[])))
+       order by sp.id`, [actor.id, groups.rows.map((row) => row.group_id)]);
+    const now = Date.now();
+    const sessions = result.rows.map((row) => {
+      const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
+      const state = !row.session_status ? "not_connected"
+        : row.session_status === "expired" || (expiresAt !== null && expiresAt <= now) ? "expired"
+          : expiresAt !== null && expiresAt - now < 2 * 86400_000 ? "expiring_soon" : "connected";
+      const meta = row.metadata ?? {};
+      return {
+        server_plugin_id: row.server_plugin_id, instance_name: row.instance_name, server_id: row.server_id, server_name: row.server_name,
+        state, expires_at: row.expires_at, connected_at: row.connected_at, last_used_at: row.last_used_at,
+        wp_user_name: meta.wp_user_name ?? null, roles: meta.roles ?? [], privileged: meta.privileged === true
+      };
+    }).sort((a, b) => `${a.server_name}${a.instance_name}`.localeCompare(`${b.server_name}${b.instance_name}`));
+    return { sessions };
+  });
+
+  // Shared by every way of connecting a session (password, 2FA relay, live browser).
+  const sessionConnectedResponse = async (request: FastifyRequest, actor: AdminUser, target: ServerPluginTarget, method: string,
+    connected: { expiresAt: Date | null; metadata: { wp_user_slug: string; wp_user_name: string; roles: string[]; privileged: boolean } }) => {
+    await auditFromRequest(options.db, request, { eventType: "wordpress_session_connect", actorUserId: actor.id, serverId: target.server.id,
+      status: "success", input: { server_plugin_id: target.id, method, wp_user: connected.metadata.wp_user_slug, privileged: connected.metadata.privileged } });
+    return {
+      session: { server_plugin_id: target.id, state: "connected", expires_at: connected.expiresAt?.toISOString() ?? null,
+        wp_user_name: connected.metadata.wp_user_name, roles: connected.metadata.roles, privileged: connected.metadata.privileged },
+      ...(connected.metadata.privileged ? { warning: "This WordPress account has administrator capabilities. An Editor-level account is safer for AI-driven editing." } : {})
+    };
+  };
+  const sessionConnectFailed = async (request: FastifyRequest, reply: FastifyReply, actor: AdminUser, target: ServerPluginTarget, method: string, err: unknown) => {
+    const mapped = err instanceof SessionConnectError ? { code: err.code, status: err.status, message: err.message } : mapToolError(err);
+    await auditFromRequest(options.db, request, { eventType: "wordpress_session_connect", actorUserId: actor.id, serverId: target.server.id,
+      status: "failure", errorCode: mapped.code, input: { server_plugin_id: target.id, method } });
+    // 401 is reserved for the AIBroker session itself (the UI signs out on it); a
+    // rejected WordPress password or code is a 422.
+    return error(reply, mapped.status >= 500 ? 502 : mapped.status === 401 ? 422 : mapped.status, mapped.code, mapped.message);
+  };
+
+  server.post<{ Body: { server_plugin_id?: string; username?: string; password?: string } }>("/me/wordpress-sessions", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const { server_plugin_id: pluginId = "", username = "", password = "" } = request.body ?? {};
+    if (!username.trim() || !password) return error(reply, 400, "validation_error", "Username and password are required.");
+    const target = await boundWordPressPlugin(actor, pluginId);
+    if (!target) return error(reply, 404, "server_plugin_not_found");
+    const rate = await consumeRateBucket(options.db, `wordpress-session-login:${actor.id}:${target.id}`, 5);
+    if (!rate.allowed) return error(reply, 429, "rate_limited", "Too many login attempts; wait a minute and try again.");
+    try {
+      const connected = await connectWordPressSession(options.db, options.config, target, actor.id, { username: username.trim(), password });
+      return await sessionConnectedResponse(request, actor, target, "password", connected);
+    } catch (err) {
+      // A relayable second factor: park the pending login and ask for the code (D6).
+      if (err instanceof WordPressSessionError && err.code === "wordpress_login_challenge" && err.pending) {
+        const captureId = await createCapture(options.db, options.config, { serverPluginId: target.id, ownerUserId: actor.id,
+          kind: "wordpress_two_factor", payload: err.pending as unknown as Record<string, unknown> });
+        reply.code(409);
+        return { error: "two_factor_required", message: err.message, capture_id: captureId };
+      }
+      // Anything else the background login cannot complete falls back to the live browser (D7).
+      if (err instanceof WordPressSessionError && err.code === "wordpress_login_challenge") {
+        await auditFromRequest(options.db, request, { eventType: "wordpress_session_connect", actorUserId: actor.id, serverId: target.server.id,
+          status: "failure", errorCode: err.code, input: { server_plugin_id: target.id, method: "password", challenge: err.challenge } });
+        reply.code(409);
+        return { error: err.code, message: err.message, challenge: err.challenge, browser_login: true };
+      }
+      return sessionConnectFailed(request, reply, actor, target, "password", err);
+    }
+  });
+
+  server.post<{ Body: { capture_id?: string; code?: string } }>("/me/wordpress-sessions/two-factor", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const capture = await loadCapture<PendingTwoFactor>(options.db, options.config, String(request.body?.capture_id ?? ""), actor.id, ["wordpress_two_factor"]);
+    if (!capture) return error(reply, 404, "capture_not_found", "This login expired. Start again.");
+    const target = await boundWordPressPlugin(actor, capture.serverPluginId);
+    if (!target) { await finishCapture(options.db, capture.id, "failed"); return error(reply, 404, "server_plugin_not_found"); }
+    try {
+      const connected = await completeWordPressTwoFactor(options.db, options.config, target, actor.id, capture.payload, String(request.body?.code ?? ""));
+      await finishCapture(options.db, capture.id, "completed");
+      return await sessionConnectedResponse(request, actor, target, "two_factor", connected);
+    } catch (err) {
+      if (err instanceof WordPressSessionError && err.code === "wordpress_2fa_invalid" && err.pending) {
+        if (capture.attempts + 1 >= MAX_TWO_FACTOR_ATTEMPTS) {
+          await finishCapture(options.db, capture.id, "failed");
+          return error(reply, 422, "wordpress_2fa_invalid", "Too many wrong codes. Start the login again.");
+        }
+        await updateCapturePayload(options.db, options.config, capture.id, err.pending as unknown as Record<string, unknown>, true);
+        return error(reply, 422, err.code, err.message);
+      }
+      await finishCapture(options.db, capture.id, "failed");
+      return sessionConnectFailed(request, reply, actor, target, "two_factor", err);
+    }
+  });
+
+  // Live remote-browser login (capture flow B): the worker opens the login page, the UI
+  // streams frames and sends clicks/keys, and the capture completes when WordPress sets
+  // its logged-in cookie.
+  server.post<{ Body: { server_plugin_id?: string } }>("/me/wordpress-sessions/browser", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const target = await boundWordPressPlugin(actor, String(request.body?.server_plugin_id ?? ""));
+    if (!target) return error(reply, 404, "server_plugin_not_found");
+    const rate = await consumeRateBucket(options.db, `wordpress-session-browser:${actor.id}:${target.id}`, 5);
+    if (!rate.allowed) return error(reply, 429, "rate_limited", "Too many login attempts; wait a minute and try again.");
+    const base = target.server.base_url.replace(/\/$/, "");
+    const loginPath = typeof target.config.login_path === "string" ? target.config.login_path : "/wp-login.php";
+    const captureId = await createCapture(options.db, options.config, { serverPluginId: target.id, ownerUserId: actor.id, kind: "wordpress_browser" });
+    try {
+      const frame = await browserRpc(options.config, {
+        capture_id: captureId, url: `${base}${loginPath}`, allowed_origins: captureOrigins(base, target.config.login_extra_origins),
+        ...captureBrowserDefaults(options.config, base, target), success_cookie_prefix: "wordpress_logged_in_"
+      }, "/v1/capture/start");
+      return { capture_id: captureId, frame };
+    } catch (err) {
+      await finishCapture(options.db, captureId, "failed");
+      const mapped = mapToolError(err);
+      return error(reply, mapped.status, mapped.code, mapped.message);
+    }
+  });
+
+  // Generic capture controls, shared by WordPress sessions and Playwright browser state.
+  server.post<{ Params: { id: string } }>("/me/login-captures/:id/frame", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const capture = await loadCapture(options.db, options.config, request.params.id, actor.id, ["wordpress_browser", "playwright_browser"]);
+    if (!capture) return error(reply, 404, "capture_not_found", "This login expired. Start again.");
+    try { return { frame: await browserRpc(options.config, { capture_id: capture.id }, "/v1/capture/frame") }; }
+    catch (err) { return captureWorkerError(reply, capture.id, err); }
+  });
+
+  server.post<{ Params: { id: string }; Body: { events?: unknown[] } }>("/me/login-captures/:id/input", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const capture = await loadCapture(options.db, options.config, request.params.id, actor.id, ["wordpress_browser", "playwright_browser"]);
+    if (!capture) return error(reply, 404, "capture_not_found", "This login expired. Start again.");
+    if (!Array.isArray(request.body?.events) || !request.body.events.length) return error(reply, 400, "validation_error", "events are required");
+    try { return { frame: await browserRpc(options.config, { capture_id: capture.id, events: request.body.events.slice(0, 50) }, "/v1/capture/input") }; }
+    catch (err) { return captureWorkerError(reply, capture.id, err); }
+  });
+
+  server.post<{ Params: { id: string } }>("/me/login-captures/:id/finish", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const capture = await loadCapture(options.db, options.config, request.params.id, actor.id, ["wordpress_browser", "playwright_browser"]);
+    if (!capture) return error(reply, 404, "capture_not_found", "This login expired. Start again.");
+    let finished: Record<string, unknown>;
+    // Playwright captures have no success cookie to wait for: "Done" finishes them.
+    try { finished = await browserRpc(options.config, { capture_id: capture.id, ...(capture.kind === "playwright_browser" ? { force: true } : {}) }, "/v1/capture/finish"); }
+    catch (err) { return captureWorkerError(reply, capture.id, err); }
+    if (finished.status !== "completed") return { status: "active" };
+    const storageState = finished.storage_state as Record<string, unknown>;
+    if (capture.kind === "wordpress_browser") {
+      const target = await boundWordPressPlugin(actor, capture.serverPluginId);
+      if (!target) { await finishCapture(options.db, capture.id, "failed"); return error(reply, 404, "server_plugin_not_found"); }
+      try {
+        const connected = await storeBrowserCapturedSession(options.db, options.config, target, actor.id, storageState);
+        await finishCapture(options.db, capture.id, "completed");
+        return { status: "completed", ...(await sessionConnectedResponse(request, actor, target, "browser", connected)) };
+      } catch (err) {
+        await finishCapture(options.db, capture.id, "failed");
+        return sessionConnectFailed(request, reply, actor, target, "browser", err);
+      }
+    }
+    const target = await getServerPlugin(options.db, capture.serverPluginId);
+    const admin = await requireAdmin(options.db, request, reply); if (!admin) return;
+    if (!target || !(await canManageServer(options.db, admin, target.server.id))) { await finishCapture(options.db, capture.id, "failed"); return error(reply, 403, "admin_denied"); }
+    try {
+      const credential = await storeBrowserStorageState(options.db, options.config, target, storageState);
+      await finishCapture(options.db, capture.id, "completed");
+      await auditFromRequest(options.db, request, { eventType: "server_plugin_credential_replace", actorUserId: admin.id,
+        serverId: target.server.id, status: "success", input: { server_plugin_id: target.id, kind: "browser_storage_state", method: "browser_capture" } });
+      return { status: "completed", credential };
+    } catch (err) {
+      await finishCapture(options.db, capture.id, "failed");
+      const mapped = mapToolError(err);
+      return error(reply, mapped.status, mapped.code, mapped.message);
+    }
+  });
+
+  server.delete<{ Params: { id: string } }>("/me/login-captures/:id", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    const capture = await loadCapture(options.db, options.config, request.params.id, actor.id);
+    if (!capture) return error(reply, 404, "capture_not_found");
+    if (capture.kind !== "wordpress_two_factor") await browserRpc(options.config, { capture_id: capture.id }, "/v1/capture/cancel").catch(() => undefined);
+    await finishCapture(options.db, capture.id, "cancelled");
+    return { status: "cancelled" };
+  });
+
+  const captureWorkerError = async (reply: FastifyReply, captureId: string, err: unknown) => {
+    const mapped = mapToolError(err);
+    if (["browser_capture_not_found", "browser_capture_expired"].includes(mapped.code)) await finishCapture(options.db, captureId, "expired");
+    return error(reply, mapped.status, mapped.code, mapped.message);
+  };
+
+  // Disconnecting only needs ownership of the session, not a current server binding.
+  server.delete<{ Params: { serverPluginId: string } }>("/me/wordpress-sessions/:serverPluginId", async (request, reply) => {
+    const actor = await requireUser(options.db, request, reply); if (!actor) return;
+    if (!/^[0-9a-f-]{36}$/i.test(request.params.serverPluginId)) return error(reply, 404, "session_not_found");
+    const target = await getServerPlugin(options.db, request.params.serverPluginId);
+    if (!target) return error(reply, 404, "session_not_found");
+    const removed = await disconnectWordPressSession(options.db, options.config, target, actor.id);
+    if (!removed) return error(reply, 404, "session_not_found");
+    await auditFromRequest(options.db, request, { eventType: "wordpress_session_disconnect", actorUserId: actor.id, serverId: target.server.id,
+      status: "success", input: { server_plugin_id: target.id } });
+    return { status: "disconnected" };
   });
 
   server.get<{ Params: { id: string } }>("/me/host-operations/:id", async (request, reply) => {
@@ -1933,7 +2267,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     return { default_mcp_server_name: name };
   });
 
-  server.get("/admin/tools", async () => {
+  server.get("/admin/tools", async (request, reply) => {
+    const actor = await requireAdmin(options.db, request, reply);
+    if (!actor) return;
     const result = await options.db.query(
       `select name, version, category, is_write, plugin_key,
               domain, action, risk, reversible, executor_kind, credential_kinds,
@@ -1956,7 +2292,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
   // The unreviewed-tools queue: tools that appeared after access was configured and have
   // not been acknowledged by an administrator. New tools are always ungranted regardless;
   // this surface simply makes them visible for review.
-  server.get("/admin/tools/unreviewed", async () => {
+  server.get("/admin/tools/unreviewed", async (request, reply) => {
+    const actor = await requireAdmin(options.db, request, reply);
+    if (!actor) return;
     const result = await options.db.query(
       `select name, domain, action, risk, description, created_at
        from tool_definitions where is_enabled = true and reviewed = false order by created_at, name`
@@ -2167,7 +2505,9 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     return { ok: true };
   });
 
-  server.get<{ Querystring: { server_id?: string; subject_id?: string } }>("/admin/bindings", async (request) => {
+  server.get<{ Querystring: { server_id?: string; subject_id?: string } }>("/admin/bindings", async (request, reply) => {
+    const actor = await requireAdmin(options.db, request, reply);
+    if (!actor) return;
     const filters: string[] = [];
     const params: unknown[] = [];
     if (request.query.server_id) {
@@ -2692,13 +3032,17 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
     }
   );
 
-  server.get("/admin/security/status", async () => ({
-    sso: { configured: false, mode: "planned" },
-    mfa: { available: false, enforced_for_admins: false },
-    key_rotation: { supported_procedure: "docs/security-operations.md" },
-    dependency_scans: { command: "npm audit --workspaces or configured scanner" },
-    container_scans: { command: "trivy image <image> or configured scanner" }
-  }));
+  server.get("/admin/security/status", async (request, reply) => {
+    const actor = await requireAdmin(options.db, request, reply);
+    if (!actor) return;
+    return {
+      sso: { configured: false, mode: "planned" },
+      mfa: { available: false, enforced_for_admins: false },
+      key_rotation: { supported_procedure: "docs/security-operations.md" },
+      dependency_scans: { command: "npm audit --workspaces or configured scanner" },
+      container_scans: { command: "trivy image <image> or configured scanner" }
+    };
+  });
 
   server.get("/mcp/tools", async (request, reply) => {
     const actor = await authenticateToken(options.db, request, reply);
@@ -3005,6 +3349,47 @@ async function closeBrowserSessionsForToken(db: pg.Pool, config: AIBrokerConfig,
     where actor_token_id=$1 and status in ('opening','active','closing')`, [tokenId, closeCode]);
 }
 
+// Store (replace) a Playwright instance's authenticated browser state. Used by both the
+// pasted-JSON credential form and the live browser capture.
+async function storeBrowserStorageState(db: pg.Pool, config: AIBrokerConfig, target: ServerPluginTarget, raw: unknown): Promise<Record<string, unknown>> {
+  try { assertAuthenticatedBrowserScope(target.config); }
+  catch (err) { throw toolError("validation_error", 400, err instanceof Error ? err.message : "Invalid browser scope"); }
+  const state = validateBrowserStorageState(filterStorageState(raw, target), target);
+  const secret = { version: 1, allowedOrigins: target.config.allowed_origins, storageState: state };
+  const encrypted = encryptJson(secret, loadEncryptionKey(config.encryptionKeyBase64));
+  await db.query("update server_credentials set status='replaced',replaced_at=now() where server_plugin_id=$1 and kind='browser_storage_state' and status='active'", [target.id]);
+  const credential = await db.query(
+    `insert into server_credentials(server_plugin_id,kind,encrypted_payload) values($1,'browser_storage_state',$2::jsonb)
+     returning id,server_plugin_id,kind,status,created_at`, [target.id, JSON.stringify(encrypted)]);
+  await closeBrowserSessionsForPlugin(db, config, target.id, "credential_replaced");
+  return credential.rows[0] as Record<string, unknown>;
+}
+
+// A live capture also collects cookies from CAPTCHA providers and other embedded origins;
+// keep only what belongs to the instance's allowed origins.
+function filterStorageState(raw: unknown, target: ServerPluginTarget): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const state = raw as { cookies?: unknown; origins?: unknown };
+  if (!Array.isArray(state.cookies) || !Array.isArray(state.origins)) return raw;
+  const allowed = new Set((target.config.allowed_origins as unknown[]).map(String));
+  const hosts = new Set([...allowed].map((origin) => new URL(origin).hostname));
+  return {
+    cookies: state.cookies.filter((cookie) => typeof (cookie as { domain?: unknown })?.domain === "string" && hosts.has(String((cookie as { domain: string }).domain).replace(/^\./, ""))),
+    origins: state.origins.filter((origin) => { try { return allowed.has(new URL(String((origin as { origin?: unknown })?.origin)).origin); } catch { return false; } })
+  };
+}
+
+// Browser settings for a live login capture of a site.
+function captureBrowserDefaults(config: AIBrokerConfig, baseUrl: string, target: ServerPluginTarget) {
+  const hostname = new URL(baseUrl).hostname;
+  const allowPrivate = config.browserAllowPrivateTargets && (hostname === target.server.address
+    || ["local", "throwaway"].includes(String(target.server.metadata.environment ?? "")));
+  return {
+    allow_private: allowPrivate, ...(allowPrivate ? { private_hostname: hostname } : {}),
+    viewport: { width: 1280, height: 800 }, locale: "en-US", timezone: "UTC", color_scheme: "light" as const
+  };
+}
+
 function validateBrowserStorageState(value: unknown, target: ServerPluginTarget): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw toolError("validation_error", 400, "Storage state must be an object.");
   const encoded = JSON.stringify(value); if (Buffer.byteLength(encoded) > 256 * 1024) throw toolError("validation_error", 400, "Storage state is too large.");
@@ -3101,6 +3486,9 @@ async function browserStorageState(db: pg.Pool, config: AIBrokerConfig, target: 
   const payload = decryptJson<{ version: number; allowedOrigins: unknown[]; storageState: Record<string, unknown> }>(found.rows[0].encrypted_payload, loadEncryptionKey(config.encryptionKeyBase64));
   const configured = JSON.stringify(target.config.allowed_origins ?? []), bound = JSON.stringify(payload.allowedOrigins ?? []);
   if (payload.version !== 1 || configured !== bound) throw toolError("browser_credential_missing", 400, "Browser authentication state must be replaced after its origin scope changes.");
+  // Also catches instances configured before path scoping was required for stored state.
+  try { assertAuthenticatedBrowserScope(target.config); }
+  catch (err) { throw toolError("browser_scope_required", 400, err instanceof Error ? err.message : "Invalid browser scope"); }
   return payload.storageState;
 }
 
@@ -3168,27 +3556,28 @@ async function executePlaywrightTool(db: pg.Pool, config: AIBrokerConfig, actor:
   if (!session) {
     const state = await browserStorageState(db, config, target); if (state) commonPayload.storage_state = state;
   } else commonPayload.worker_lease_id = session.worker_lease_id;
-  const perform = async () => {
-    try {
-      const result = await browserRpc(config, commonPayload);
-      if (session) await touchBrowserSession(db, session, tool, result);
-      return result;
-    } catch (error) {
-      const code = mapToolError(error).code;
-      if (session && ["browser_session_not_found", "browser_session_expired"].includes(code)) {
-        await db.query("update leased_sessions set status=$2,closed_at=now(),error_code=$3,version=version+1 where id=$1 and status in ('opening','active','closing')",
-          [session.id, code === "browser_session_expired" ? "expired" : "failed", code]);
-      }
-      throw error;
-    }
+  const perform = async (transaction: Pick<pg.Pool, "query"> = db) => {
+    const result = await browserRpc(config, commonPayload);
+    if (session) await touchBrowserSession(transaction, session, tool, result);
+    return result;
   };
   let result: Record<string, unknown>;
-  if (tool === "playwright.click") {
-    const idempotencyKey = stringField(input, "idempotency_key");
-    if (idempotencyKey.length < 16) throw toolError("validation_error", 400, "idempotency_key must be at least 16 characters");
-    result = await executeIdempotent(db, actor.tokenId, target.server.id, tool, idempotencyKey,
-      sha256(JSON.stringify({ serverPluginId: target.id, sessionId, locator: input.locator })), perform);
-  } else result = await perform();
+  try {
+    if (tool === "playwright.click") {
+      const idempotencyKey = stringField(input, "idempotency_key");
+      if (idempotencyKey.length < 16) throw toolError("validation_error", 400, "idempotency_key must be at least 16 characters");
+      result = await executeIdempotent(db, actor.tokenId, target.server.id, tool, idempotencyKey,
+        sha256(JSON.stringify({ serverPluginId: target.id, sessionId, locator: input.locator })), perform);
+    } else result = await perform();
+  } catch (error) {
+    const code = mapToolError(error).code;
+    if (session && ["browser_session_not_found", "browser_session_expired"].includes(code)) {
+      // Persist lifecycle failures after the idempotency transaction has rolled back.
+      await db.query("update leased_sessions set status=$2,closed_at=now(),error_code=$3,version=version+1 where id=$1 and status in ('opening','active','closing')",
+        [session.id, code === "browser_session_expired" ? "expired" : "failed", code]);
+    }
+    throw error;
+  }
   if (tool !== "playwright.capture_screenshot") {
     return browserResult({ ...result, ...(session ? { session_id: session.id } : {}) });
   }
@@ -3284,7 +3673,7 @@ async function requireBrowserSession(db: pg.Pool, config: AIBrokerConfig, actor:
   return session;
 }
 
-async function touchBrowserSession(db: pg.Pool, session: LeasedBrowserSession, tool: string, result: Record<string, unknown>): Promise<void> {
+async function touchBrowserSession(db: Pick<pg.Pool, "query">, session: LeasedBrowserSession, tool: string, result: Record<string, unknown>): Promise<void> {
   const cursorKind = tool === "playwright.get_console_messages" ? "console" : tool === "playwright.get_page_errors" ? "errors" : null;
   await db.query(
     `update leased_sessions set current_url=coalesce($2,current_url),last_activity_at=now(),idle_expires_at=least(now()+interval '5 minutes',absolute_expires_at),
@@ -3357,16 +3746,20 @@ async function executeSshTool(
     const full = await db.query(
       `select 1 from server_bindings sb join policy_plugin_intents pi on pi.policy_id=sb.policy_id
        where sb.server_id=$1 and pi.plugin_key='ssh' and pi.access_level='full'
-         and (pi.instance_name is null or pi.instance_name=$4)
+         -- An instance-specific intent overrides the policy-wide one (same rule as evaluatePolicy).
+         and (pi.instance_name=$4 or (pi.instance_name is null and not exists (
+           select 1 from policy_plugin_intents override_intent
+           where override_intent.policy_id=pi.policy_id and override_intent.plugin_key=pi.plugin_key and override_intent.instance_name=$4
+         )))
          and ((sb.subject_type='user' and sb.subject_id=$2) or (sb.subject_type='group' and sb.subject_id=any($3::uuid[]))) limit 1`,
       [target.server.id, actor.userId, actor.groupIds, target.instanceName]
     );
     if (!full.rowCount) throw toolError("full_grant_required", 403, "Raw SSH commands require an explicit Full SSH grant.");
     const key = stringField(input, "idempotency_key");
     const hash = sha256(JSON.stringify({ serverPluginId: target.id, tool, command: input.command, reason }));
-    return executeIdempotent(db, actor.tokenId, target.server.id, tool, key, hash, async () => {
-      const queued = await enqueueHostOperation(db, actor, target.server.id, tool, input, "ssh", target.id);
-      await writeAuditEvent(db, {
+    return executeIdempotent(db, actor.tokenId, target.server.id, tool, key, hash, async (client) => {
+      const queued = await enqueueHostOperation(db, actor, target.server.id, tool, input, "ssh", target.id, client);
+      await writeAuditEvent(client, {
         requestId: `break-glass:${queued.operation_id}`, eventType: "break_glass_used", actorUserId: actor.userId,
         actorTokenId: actor.tokenId, serverId: target.server.id, toolName: tool, status: "success",
         input: { command: input.command, server_plugin_id: target.id }, reason, executorKind: "ssh",
@@ -3375,7 +3768,7 @@ async function executeSshTool(
       return queued;
     });
   }
-  const enqueue = () => enqueueHostOperation(db, actor, target.server.id, tool, input, "ssh", target.id);
+  const enqueue = (client?: pg.PoolClient) => enqueueHostOperation(db, actor, target.server.id, tool, input, "ssh", target.id, client);
   if (!isWriteTool(tool)) return enqueue();
   const key = stringField(input, "idempotency_key");
   const hash = sha256(JSON.stringify({ serverPluginId: target.id, tool, input: { ...input, idempotency_key: undefined } }));
@@ -3401,16 +3794,20 @@ async function executePostgresTool(
     const full = await db.query(
       `select 1 from server_bindings sb join policy_plugin_intents pi on pi.policy_id=sb.policy_id
        where sb.server_id=$1 and pi.plugin_key='postgres' and pi.access_level='full'
-         and (pi.instance_name is null or pi.instance_name=$4)
+         -- An instance-specific intent overrides the policy-wide one (same rule as evaluatePolicy).
+         and (pi.instance_name=$4 or (pi.instance_name is null and not exists (
+           select 1 from policy_plugin_intents override_intent
+           where override_intent.policy_id=pi.policy_id and override_intent.plugin_key=pi.plugin_key and override_intent.instance_name=$4
+         )))
          and ((sb.subject_type='user' and sb.subject_id=$2) or (sb.subject_type='group' and sb.subject_id=any($3::uuid[]))) limit 1`,
       [target.server.id, actor.userId, actor.groupIds, target.instanceName]
     );
     if (!full.rowCount) throw toolError("full_grant_required", 403, "Unrestricted SQL requires an explicit Full Postgres grant.");
     const key = stringField(input, "idempotency_key");
     const hash = sha256(JSON.stringify({ serverPluginId: target.id, sql: input.sql, parameters: input.parameters, reason }));
-    return executeIdempotent(db, actor.tokenId, target.server.id, tool, key, hash, async () => {
-      const queued = await enqueueHostOperation(db, actor, target.server.id, tool, input, "postgres", target.id);
-      await writeAuditEvent(db, { requestId: `break-glass:${queued.operation_id}`, eventType: "break_glass_used",
+    return executeIdempotent(db, actor.tokenId, target.server.id, tool, key, hash, async (client) => {
+      const queued = await enqueueHostOperation(db, actor, target.server.id, tool, input, "postgres", target.id, client);
+      await writeAuditEvent(client, { requestId: `break-glass:${queued.operation_id}`, eventType: "break_glass_used",
         actorUserId: actor.userId, actorTokenId: actor.tokenId, serverId: target.server.id, toolName: tool,
         status: "success", input: { sql: input.sql, parameters: input.parameters, server_plugin_id: target.id }, reason,
         executorKind: "postgres", operationId: queued.operation_id, toolDomain: "postgres_data", toolAction: "operate", toolRisk: "critical" });
@@ -3498,6 +3895,17 @@ async function executeWordPressTool(
   const server = target.server;
   const decision = await evaluateAccess(db, actor, server, tool, isWriteTool(tool), input, target);
   if (!decision.allowed) throw toolError(decision.reason, 403);
+  const callsPerMinute = decision.effectiveConstraints["rateLimit.callsPerMinute"];
+  if (typeof callsPerMinute === "number") {
+    const rate = await consumeRateBucket(db, `constraint:${actor.userId}:${server.id}:${tool}`, callsPerMinute);
+    if (!rate.allowed) throw toolError("rate_limited", 429, rate.reason);
+  }
+  // Policy only rejects an explicit over-limit request, so an omitted limit must be
+  // clamped here too — otherwise the handler's default (50) exceeds maxResults.
+  const maxResults = decision.effectiveConstraints.maxResults;
+  if (typeof maxResults === "number") {
+    input = { ...input, limit: Math.min(typeof input.limit === "number" ? input.limit : maxResults, maxResults) };
+  }
   const backupAge = decision.effectiveConstraints.requiredBackupMaxAgeHours;
   if (typeof backupAge === "number") {
     const recent = await db.query("select 1 from backups where server_id=$1 and status in ('available','verified') and created_at>now()-($2::text||' hours')::interval limit 1", [server.id, backupAge]);
@@ -3513,6 +3921,46 @@ async function executeWordPressTool(
   // with the connector's SSRF/timeout/size hardening, and mutations go through the same
   // idempotency machinery as the Phase 1 page tools. last_used_at is bumped only after the
   // handler actually completes a request.
+  // Page-builder tools (AB-ELEMENTOR) run on the shared REST credential plus, where
+  // REST cannot do the job, the calling user's own WordPress login session.
+  const builderHandler = PAGE_BUILDER_TOOL_HANDLERS[tool];
+  if (builderHandler) {
+    const credential = await requireRestCredential(db, config, target.id, true);
+    let sessionCredentialId: string | null = null;
+    let sessionLoad: ReturnType<typeof loadWordPressSession> | undefined;
+    const ctx: PageBuilderToolCtx = {
+      toolName: tool,
+      input,
+      rest: restClient(config, server, credential.payload),
+      session: async () => {
+        sessionLoad ??= loadWordPressSession(db, config, target, actor.userId);
+        const loaded = await sessionLoad;
+        sessionCredentialId = loaded?.credentialId ?? null;
+        return loaded?.client ?? null;
+      },
+      snapshots: snapshotStore(db, target.id, actor.userId),
+      pluginConfig: target.config,
+      idempotent: <T,>(action: () => Promise<T>) => {
+        const idempotencyKey = stringField(input, "idempotency_key");
+        const { idempotency_key: _omit, ...rest } = input;
+        const inputHash = sha256(JSON.stringify({ serverId: server.id, tool, rest }));
+        return executeIdempotent(db, actor.tokenId, server.id, tool, idempotencyKey, inputHash, action);
+      },
+      toolError
+    };
+    try {
+      const result = await builderHandler(ctx);
+      await db.query("update server_credentials set last_used_at = now() where id = any($1::uuid[])",
+        [[credential.id, ...(sessionCredentialId ? [sessionCredentialId] : [])]]);
+      return result;
+    } catch (err) {
+      if (err instanceof WordPressSessionError && err.code === "wordpress_session_expired" && sessionCredentialId) {
+        await markSessionExpired(db, sessionCredentialId);
+      }
+      throw err;
+    }
+  }
+
   const restHandler = REST_TOOL_HANDLERS[tool];
   if (restHandler) {
     const credential = await requireRestCredential(db, config, target.id, true);
@@ -3593,7 +4041,7 @@ async function executeWordPressTool(
   }
 
   if (TOOL_META.get(tool)?.executorKind === "wp_cli") {
-    const enqueue = () => enqueueHostOperation(db, actor, server.id, tool, input, "ssh");
+    const enqueue = (client?: pg.PoolClient) => enqueueHostOperation(db, actor, server.id, tool, input, "ssh", undefined, client);
     if (isWriteTool(tool)) {
       const idempotencyKey = stringField(input, "idempotency_key");
       const inputHash = sha256(JSON.stringify({ serverId: server.id, tool, input: { ...input, idempotency_key: undefined } }));
@@ -3602,7 +4050,7 @@ async function executeWordPressTool(
     return enqueue();
   }
   if (TOOL_META.get(tool)?.executorKind === "workspace") {
-    const enqueue = () => enqueueHostOperation(db, actor, server.id, tool, input, "ssh");
+    const enqueue = (client?: pg.PoolClient) => enqueueHostOperation(db, actor, server.id, tool, input, "ssh", undefined, client);
     if (isWriteTool(tool)) {
       const key=stringField(input,"idempotency_key"); const hash=sha256(JSON.stringify({serverId:server.id,tool,input:{...input,idempotency_key:undefined}}));
       return executeIdempotent(db,actor.tokenId,server.id,tool,key,hash,enqueue);
@@ -3610,7 +4058,7 @@ async function executeWordPressTool(
     return enqueue();
   }
   if (["database","hosting"].includes(TOOL_META.get(tool)?.executorKind ?? "")) {
-    const executor=TOOL_META.get(tool)!.executorKind;const enqueue=()=>enqueueHostOperation(db,actor,server.id,tool,input,executor==="hosting"?"hosting":"ssh");
+    const executor=TOOL_META.get(tool)!.executorKind;const enqueue=(client?: pg.PoolClient)=>enqueueHostOperation(db,actor,server.id,tool,input,executor==="hosting"?"hosting":"ssh",undefined,client);
     if(isWriteTool(tool)){const key=stringField(input,"idempotency_key");const hash=sha256(JSON.stringify({serverId:server.id,tool,input:{...input,idempotency_key:undefined}}));return executeIdempotent(db,actor.tokenId,server.id,tool,key,hash,enqueue);}return enqueue();
   }
 
@@ -3620,8 +4068,8 @@ async function executeWordPressTool(
     const content = stringField(input, "content");
     const slug = typeof input.slug === "string" ? input.slug : null;
     const inputHash = sha256(JSON.stringify({ serverId: server.id, title, slug, content }));
-    return executeIdempotent(db, actor.tokenId, server.id, tool, idempotencyKey, inputHash, async () => {
-      const credential = await requireRestCredential(db, config, target.id, true);
+    return executeIdempotent(db, actor.tokenId, server.id, tool, idempotencyKey, inputHash, async (transaction) => {
+      const credential = await requireRestCredential(transaction, config, target.id, true);
       const client = restClient(config, server, credential.payload);
       return { page: await client.createDraftPage({ title, slug, content }), idempotency_key: idempotencyKey };
     });
@@ -3634,8 +4082,8 @@ async function executeWordPressTool(
     const title = typeof input.title === "string" ? input.title : null;
     const content = typeof input.content === "string" ? input.content : null;
     const inputHash = sha256(JSON.stringify({ serverId: server.id, pageId, expectedRevisionId, title, content }));
-    return executeIdempotent(db, actor.tokenId, server.id, tool, idempotencyKey, inputHash, async () => {
-      const credential = await requireRestCredential(db, config, target.id, true);
+    return executeIdempotent(db, actor.tokenId, server.id, tool, idempotencyKey, inputHash, async (transaction) => {
+      const credential = await requireRestCredential(transaction, config, target.id, true);
       const page = await restClient(config, server, credential.payload).updateDraftPage({ pageId, expectedRevisionId, title, content });
       return { page, idempotency_key: idempotencyKey };
     });
@@ -3645,8 +4093,8 @@ async function executeWordPressTool(
     const idempotencyKey = stringField(input, "idempotency_key");
     const pageId = stringField(input, "page_id");
     const inputHash = sha256(JSON.stringify({ serverId: server.id, pageId }));
-    return executeIdempotent(db, actor.tokenId, server.id, tool, idempotencyKey, inputHash, async () => {
-      const credential = await requireRestCredential(db, config, target.id, true);
+    return executeIdempotent(db, actor.tokenId, server.id, tool, idempotencyKey, inputHash, async (transaction) => {
+      const credential = await requireRestCredential(transaction, config, target.id, true);
       const page = await restClient(config, server, credential.payload).publishDraftPage(pageId);
       return { page, idempotency_key: idempotencyKey };
     });
@@ -3655,14 +4103,14 @@ async function executeWordPressTool(
   throw toolError("validation_error", 400);
 }
 
-async function executeIdempotent<T>(
+export async function executeIdempotent<T>(
   db: pg.Pool,
   tokenId: string,
   serverId: string,
   toolName: string,
   idempotencyKey: string,
   inputHash: string,
-  action: () => Promise<T>
+  action: (client: pg.PoolClient) => Promise<T>
 ): Promise<T> {
   const client = await db.connect();
   try {
@@ -3679,7 +4127,7 @@ async function executeIdempotent<T>(
       await client.query("commit");
       return existing.rows[0].response_payload;
     }
-    const response = await action();
+    const response = await action(client);
     await client.query(
       `insert into idempotency_keys (actor_token_id, server_id, tool_name, idempotency_key, input_hash, response_payload)
        values ($1,$2,$3,$4,$5,$6::jsonb)`,
@@ -3822,23 +4270,58 @@ async function checkRateLimit(
   }
 }
 
-async function sessionUserId(request: FastifyRequest, secret: string): Promise<string | null> {
+// Single-bucket sliding-window limiter over rate_limit_events, used for policy-configured
+// per-tool limits (the rateLimit.callsPerMinute constraint).
+async function consumeRateBucket(db: pg.Pool, bucket: string, max: number): Promise<{ allowed: boolean; reason?: string }> {
+  const client = await db.connect();
+  try {
+    await client.query("begin");
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", [bucket]);
+    const count = await client.query<{ count: number }>(
+      "select count(*)::int as count from rate_limit_events where bucket = $1 and created_at > now() - interval '1 minute'",
+      [bucket]
+    );
+    if (Number(count.rows[0]?.count ?? 0) >= max) {
+      await client.query("rollback");
+      return { allowed: false, reason: `policy limit of ${max}/minute exceeded` };
+    }
+    await client.query("insert into rate_limit_events (bucket) values ($1)", [bucket]);
+    await client.query("commit");
+    return { allowed: true };
+  } catch (err) {
+    await client.query("rollback").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function sessionClaims(request: FastifyRequest, secret: string): Promise<{ sub: string; ep: number } | null> {
   const token = request.headers["x-aibroker-session"];
   if (!token || Array.isArray(token)) return null;
   return verifySessionToken(token, secret);
 }
 
+// A token is only valid for the epoch it was issued under; see migration 008.
+function sessionEpochMatches(user: AdminUser, claims: { ep: number }): boolean {
+  return (user.session_epoch ?? 0) === claims.ep;
+}
+
 async function requireAdmin(db: pg.Pool, request: FastifyRequest, reply: FastifyReply): Promise<AdminUser | null> {
-  const id = await sessionUserId(request, request.server.config.sessionSecret);
-  if (!id) {
+  const claims = await sessionClaims(request, request.server.config.sessionSecret);
+  if (!claims) {
     reply.code(401).send({ error: "admin_auth_required" });
     return null;
   }
   const result = await db.query<AdminUser>(
-    "select id, owner_user_id, email, display_name, role, status, password_change_required from users where id = $1",
-    [id]
+    "select id, owner_user_id, email, display_name, role, status, password_change_required, session_epoch from users where id = $1",
+    [claims.sub]
   );
   const user = result.rows[0];
+  if (user && !sessionEpochMatches(user, claims)) {
+    reply.code(401).send({ error: "admin_auth_required" });
+    return null;
+  }
   if (!user || user.status !== "active" || !["global_admin", "team_admin"].includes(user.role)) {
     reply.code(403).send({ error: "admin_denied" });
     return null;
@@ -3864,17 +4347,17 @@ async function requireGlobalAdmin(db: pg.Pool, request: FastifyRequest, reply: F
 // self-service /me/* routes. Same header-based identity as requireAdmin, but no
 // role gate — governance is enforced per-route by scoping rows to the actor.
 async function requireUser(db: pg.Pool, request: FastifyRequest, reply: FastifyReply): Promise<AdminUser | null> {
-  const id = await sessionUserId(request, request.server.config.sessionSecret);
-  if (!id) {
+  const claims = await sessionClaims(request, request.server.config.sessionSecret);
+  if (!claims) {
     reply.code(401).send({ error: "auth_required" });
     return null;
   }
   const result = await db.query<AdminUser>(
-    "select id, owner_user_id, email, display_name, role, status, password_change_required from users where id = $1",
-    [id]
+    "select id, owner_user_id, email, display_name, role, status, password_change_required, session_epoch from users where id = $1",
+    [claims.sub]
   );
   const user = result.rows[0];
-  if (!user || user.status !== "active") {
+  if (!user || user.status !== "active" || !sessionEpochMatches(user, claims)) {
     reply.code(401).send({ error: "auth_required" });
     return null;
   }
@@ -3900,6 +4383,14 @@ async function canManageUser(db: Pick<pg.Pool, "query">, actor: AdminUser, userI
   return Boolean(result.rowCount);
 }
 
+async function isLastGlobalAdmin(db: Pick<pg.Pool, "query">, userId: string): Promise<boolean> {
+  const others = await db.query(
+    "select 1 from users where role = 'global_admin' and status = 'active' and id <> $1 limit 1",
+    [userId]
+  );
+  return !others.rowCount;
+}
+
 async function canUseOwner(db: Pick<pg.Pool, "query">, actor: AdminUser, ownerUserId: string): Promise<boolean> {
   if (actor.role === "global_admin") return true;
   if (actor.id === ownerUserId) return true;
@@ -3914,24 +4405,31 @@ async function canManageGroup(db: Pick<pg.Pool, "query">, actor: AdminUser, grou
   return canUseOwner(db, actor, ownerUserId);
 }
 
-async function canManageServer(db: Pick<pg.Pool, "query">, actor: AdminUser, serverId: string): Promise<boolean> {
-  if (actor.role === "global_admin") return true;
-  const result = await db.query(
-    `with recursive scope as (
+// Servers a non-global admin manages: those bound to a user or group in their ownership scope.
+const MANAGED_SERVERS_SQL = `with recursive scope as (
        select $1::uuid as id union all
        select u.id from users u join scope on u.owner_user_id = scope.id
      )
-     select 1 from servers s
-     where s.id = $2 and exists (
+     select s.id from servers s
+     where exists (
          select 1 from server_bindings sb
          where sb.server_id = s.id and (
            (sb.subject_type = 'user' and sb.subject_id in (select id from scope))
            or (sb.subject_type = 'group' and sb.subject_id in (select id from groups where owner_user_id in (select id from scope)))
          )
-     ) limit 1`,
-    [actor.id, serverId]
-  );
+     )`;
+
+async function canManageServer(db: Pick<pg.Pool, "query">, actor: AdminUser, serverId: string): Promise<boolean> {
+  if (actor.role === "global_admin") return true;
+  const result = await db.query(`select 1 from (${MANAGED_SERVERS_SQL}) managed where managed.id = $2 limit 1`, [actor.id, serverId]);
   return Boolean(result.rowCount);
+}
+
+// null means unrestricted (global admin).
+async function managedServerIds(db: Pick<pg.Pool, "query">, actor: AdminUser): Promise<string[] | null> {
+  if (actor.role === "global_admin") return null;
+  const result = await db.query<{ id: string }>(MANAGED_SERVERS_SQL, [actor.id]);
+  return result.rows.map((row) => row.id);
 }
 
 async function canManagePolicy(db: Pick<pg.Pool, "query">, actor: AdminUser, policyId: string): Promise<boolean> {
@@ -4087,12 +4585,41 @@ async function authenticateToken(db: pg.Pool, request: FastifyRequest, reply: Fa
   };
 }
 
+// Failed-login throttling. The window must stay within the 10-minute retention that
+// checkRateLimit prunes rate_limit_events to.
+const LOGIN_FAILURES_PER_EMAIL = 10;
+const LOGIN_FAILURES_PER_IP = 50;
+
+async function loginThrottled(db: pg.Pool, email: string, ip: string): Promise<boolean> {
+  const result = await db.query<{ email_failures: number; ip_failures: number }>(
+    `select count(*) filter (where bucket = $1)::int as email_failures,
+            count(*) filter (where bucket = $2)::int as ip_failures
+     from rate_limit_events where bucket in ($1, $2) and created_at > now() - interval '10 minutes'`,
+    [`login_fail:email:${email}`, `login_fail:ip:${ip}`]
+  );
+  const row = result.rows[0];
+  return Number(row?.email_failures ?? 0) >= LOGIN_FAILURES_PER_EMAIL || Number(row?.ip_failures ?? 0) >= LOGIN_FAILURES_PER_IP;
+}
+
+async function recordLoginFailure(db: pg.Pool, email: string, ip: string): Promise<void> {
+  await db.query("insert into rate_limit_events (bucket) values ($1), ($2)", [`login_fail:email:${email}`, `login_fail:ip:${ip}`]);
+}
+
+// Always run one scrypt verification, even for unknown or inactive users, so response
+// time does not reveal whether an account exists.
+let dummyPasswordHash: Promise<string> | undefined;
+async function checkPassword(user: { status: string; password_hash: string } | undefined, password: string): Promise<boolean> {
+  const hash = user?.password_hash ?? await (dummyPasswordHash ??= hashPassword(randomUUID()));
+  const matches = await verifyPassword(password, hash);
+  return Boolean(user && user.status === "active" && matches);
+}
+
 async function findUserByEmail(
   db: pg.Pool,
   email: string
 ): Promise<(AdminUser & { password_hash: string }) | undefined> {
   const result = await db.query<AdminUser & { password_hash: string }>(
-    "select id, owner_user_id, email, display_name, password_hash, role, status, password_change_required from users where email = $1",
+    "select id, owner_user_id, email, display_name, password_hash, role, status, password_change_required, session_epoch from users where email = $1",
     [email]
   );
   return result.rows[0];
@@ -4129,7 +4656,7 @@ async function getServerPlugin(db: Pick<pg.Pool, "query">, serverPluginId: strin
   const server = { id: row.server_id, name: row.server_name, address: row.address,
     base_url: "", status: row.server_status, capabilities: {}, metadata: row.metadata ?? {} } as ServerRow & { metadata: Record<string, unknown> };
   const config = interpolateServerConfig(row.config ?? {}, server) as Record<string, unknown>;
-  server.base_url = typeof config.base_url === "string" ? config.base_url : `http://${server.address}`;
+  server.base_url = typeof config.base_url === "string" ? config.base_url : `https://${server.address}`;
   return { id: row.id, pluginKey: row.plugin_key, instanceName: row.instance_name, status: row.status, config, server };
 }
 
@@ -4172,8 +4699,24 @@ async function probeWordPressCapabilities(db: pg.Pool, config: AIBrokerConfig, t
     { capability: "rest_authenticated", status: yn(discovery.authenticated), executorKind: "rest", credentialId: credential.id,
       ...(!discovery.authenticated ? { errorCode: discovery.errorCode, errorMessage: discovery.errorMessage } : {}) },
     { capability: "media_upload", status: yn(discovery.mediaSupported), executorKind: "rest", credentialId: credential.id,
-      ...(!discovery.mediaSupported && discovery.errorCode ? { errorCode: discovery.errorCode, errorMessage: discovery.errorMessage } : {}) }
+      ...(!discovery.mediaSupported && discovery.errorCode ? { errorCode: discovery.errorCode, errorMessage: discovery.errorMessage } : {}) },
+    ...(discovery.authenticated ? await probePageBuilders(restClient(config, target.server, credential.payload), credential.id) : [])
   ];
+}
+
+// One capability per registered page-builder adapter, e.g. "elementor_page_builder",
+// with version, REST-meta and cache-refresh details for the admin Capabilities tab.
+async function probePageBuilders(client: WordPressRestClient, credentialId: string) {
+  return Promise.all(PAGE_BUILDER_ADAPTERS.map(async (adapter) => {
+    const capability = `${adapter.key}_page_builder`;
+    try {
+      const detected = await adapter.detect(client);
+      return { capability, status: detected.active ? "available" as const : "unavailable" as const, executorKind: "rest", credentialId,
+        details: { version: detected.version, ...detected.details } };
+    } catch (err) {
+      return { capability, status: "unknown" as const, executorKind: "rest", credentialId, errorCode: mapToolError(err).code };
+    }
+  }));
 }
 
 async function probeSshCapabilities(db: pg.Pool, config: AIBrokerConfig, target: ServerPluginTarget) {
@@ -4320,7 +4863,7 @@ async function deprovisionPostgresRole(input: { credential: { connectionString: 
 }
 
 async function getRestCredential(
-  db: pg.Pool,
+  db: Pick<pg.Pool, "query">,
   config: AIBrokerConfig,
   targetId: string,
   isServerPlugin = false
@@ -4341,24 +4884,26 @@ async function getRestCredential(
   };
 }
 
-async function enqueueHostOperation(
+export async function enqueueHostOperation(
   db: pg.Pool,
   actor: TokenActor,
   serverId: string,
   toolName: string,
   input: Record<string, unknown>,
   connectorKind: "ssh" | "hosting" | "postgres",
-  serverPluginId?: string
+  serverPluginId?: string,
+  transaction?: pg.PoolClient
 ): Promise<{ operation_id: string; status: "queued" }> {
+  const queryDb = transaction ?? db;
   const connector = connectorKind === "ssh"
-    ? await db.query("select 1 from ssh_connectors c join server_credentials sc on sc.id=c.credential_id where c.server_id=$1 and sc.status='active'", [serverId])
+    ? await queryDb.query("select 1 from ssh_connectors c join server_credentials sc on sc.id=c.credential_id where c.server_id=$1 and sc.status='active'", [serverId])
     : connectorKind === "hosting"
-      ? await db.query("select 1 from hosting_providers p join server_credentials sc on sc.id=p.credential_id where p.server_id=$1 and sc.status='active'", [serverId])
-      : await db.query("select 1 from postgres_connectors p join server_credentials sc on sc.id=p.credential_id where p.server_plugin_id=$1 and sc.status='active'", [serverPluginId]);
+      ? await queryDb.query("select 1 from hosting_providers p join server_credentials sc on sc.id=p.credential_id where p.server_id=$1 and sc.status='active'", [serverId])
+      : await queryDb.query("select 1 from postgres_connectors p join server_credentials sc on sc.id=p.credential_id where p.server_plugin_id=$1 and sc.status='active'", [serverPluginId]);
   if (!connector.rowCount) throw toolError(`${connectorKind}_credential_missing`, 400, `No active ${connectorKind} connector is configured for this server.`);
-  const client = await db.connect();
+  const client = transaction ?? await db.connect();
   try {
-    await client.query("begin");
+    if (!transaction) await client.query("begin");
     const persistedInput = toolName === "ssh.run_command" || toolName === "postgres.run_sql" ? input : redactObject(input);
     const operation = await client.query<{ id: string }>(
       `insert into host_operations(server_id, server_plugin_id, actor_user_id, actor_token_id, tool_name, input, reason)
@@ -4371,16 +4916,16 @@ async function enqueueHostOperation(
       [serverId, operationId, connectorKind === "hosting" ? "provider.operation" : connectorKind === "postgres" ? "database.operation" : "host.wp_cli"]
     );
     await client.query("update host_operations set job_id=$2 where id=$1", [operationId, job.rows[0]!.id]);
-    await client.query("commit");
+    if (!transaction) await client.query("commit");
     return { operation_id: operationId, status: "queued" };
   } catch (error) {
-    await client.query("rollback");
+    if (!transaction) await client.query("rollback");
     throw error;
-  } finally { client.release(); }
+  } finally { if (!transaction) client.release(); }
 }
 
 async function requireRestCredential(
-  db: pg.Pool,
+  db: Pick<pg.Pool, "query">,
   config: AIBrokerConfig,
   targetId: string,
   isServerPlugin = false
@@ -4522,6 +5067,7 @@ function toolError(code: string, status = 400, message?: string): Error & { code
 }
 
 function mapToolError(err: unknown): { code: string; status: number; message?: string } {
+  if (err instanceof WordPressSessionError) return { code: err.code, status: err.statusCode, message: err.message };
   if (err instanceof WordPressRestError) {
     // Distinguish credential rejection, a missing endpoint/resource, and connector faults
     // (timeouts, oversized responses) from a generic WordPress error. The

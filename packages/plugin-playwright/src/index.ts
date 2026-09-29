@@ -148,6 +148,16 @@ export function normalizePlaywrightConfig(config: Record<string, unknown>, serve
   };
 }
 
+// A stored browser_storage_state logs every session in as that user, so an instance that
+// holds one must be confined to explicit path prefixes. Without them (or with "/") the
+// medium-risk interaction tools could drive the whole authenticated app, e.g. wp-admin.
+export function assertAuthenticatedBrowserScope(config: Record<string, unknown>): void {
+  const prefixes = strings(config.allowed_path_prefixes);
+  if (!prefixes.length || prefixes.some((path) => path === "/")) {
+    throw new Error("Authenticated browser state requires allowed_path_prefixes narrower than \"/\"");
+  }
+}
+
 export const playwrightPlugin: BrokerPlugin = {
   key: "playwright", name: "Playwright Browser", version: 2,
   description: "Inspect allowed pages with isolated one-shot calls or short-lived, typed browser sessions.",

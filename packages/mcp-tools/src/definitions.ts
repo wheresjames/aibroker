@@ -8,6 +8,7 @@ import {
   type ToolRisk
 } from "./catalog.js";
 import { REST_TOOL_DEFINITIONS } from "./rest-definitions.js";
+import { PAGE_BUILDER_TOOL_DEFINITIONS } from "./page-builder-definitions.js";
 import { HOST_SESSION_TOOL_DEFINITIONS, HOST_TOOL_DEFINITIONS, WORKSPACE_TOOL_DEFINITIONS } from "./host-definitions.js";
 import { HOSTING_TOOL_DEFINITIONS, MULTISITE_TOOL_DEFINITIONS, RECOVERY_TOOL_DEFINITIONS } from "./operations-definitions.js";
 
@@ -394,6 +395,7 @@ const RAW_TOOL_DEFINITIONS: ToolDefinition[] = [
     })
   ),
   ...REST_TOOL_DEFINITIONS,
+  ...PAGE_BUILDER_TOOL_DEFINITIONS,
   ...HOST_TOOL_DEFINITIONS,
   ...WORKSPACE_TOOL_DEFINITIONS,
   ...HOST_SESSION_TOOL_DEFINITIONS,
